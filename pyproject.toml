@@ -1,0 +1,36 @@
+[project]
+name = "hr-attendance-dashboard"
+version = "2.0.0"
+description = "HR attendance, payroll & sales performance dashboard for car dealership operations"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "streamlit==1.63.0",
+    "pandas==2.2.3",
+    "numpy==2.3.5",
+    "openpyxl==3.1.5",
+    "plotly==6.5.2",
+    "reportlab==4.4.9",
+    "xlrd==2.0.2",
+]
+
+[tool.pycrucible]
+entrypoint = "run_hr_dashboard.py"
+
+[tool.pycrucible.options]
+debug = false
+extract_to_temp = false
+delete_after_run = false
+uv_version = "0.9.21"
+
+[tool.pycrucible.patterns]
+include = [
+    "hrdash/**/*.py",
+    "streamlit_app.py",
+    "run_hr_dashboard.py",
+    "template_cuti_karyawan.xlsx",
+]
+exclude = [
+    "**/__pycache__/**",
+    ".git/**",
+    ".venv/**",
+]

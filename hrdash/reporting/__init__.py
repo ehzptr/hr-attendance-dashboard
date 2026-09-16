@@ -1,0 +1,1 @@
+"""Excel workbook generation."""
