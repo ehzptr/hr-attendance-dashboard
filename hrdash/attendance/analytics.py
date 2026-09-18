@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+from typing import Optional
+
+import polars as pl
 
 from ..config import ScoreConfig
 
 
-def calculate_employee_summary(daily: pd.DataFrame, score_cfg: ScoreConfig) -> pd.DataFrame:
+def calculate_employee_summary(daily: pl.DataFrame, score_cfg: ScoreConfig) -> pl.DataFrame:
     """Employee-level KPI table (Section 6).
 
     ``Attendance_Score`` counts one "issue day" per calendar day that has
@@ -17,161 +18,195 @@ def calculate_employee_summary(daily: pd.DataFrame, score_cfg: ScoreConfig) -> p
     wrong on it. This mirrors how compliance is judged in HR practice: one
     problematic day is one problematic day.
     """
-    if daily.empty:
-        return pd.DataFrame()
+    if daily.is_empty():
+        return pl.DataFrame()
 
-    work = daily[daily["Is_Working_Day"]].copy()
-
-    df_calc = daily.copy()
+    df_calc = daily
     if "Tidak_Absen_Pulang_Flag" not in df_calc.columns:
-        df_calc["Tidak_Absen_Pulang_Flag"] = (
-            df_calc["Status_Pulang"].eq("Lupa Absen Pulang").astype(int)
-            if "Status_Pulang" in df_calc.columns
-            else 0
-        )
+        if "Status_Pulang" in df_calc.columns:
+            df_calc = df_calc.with_columns(
+                Tidak_Absen_Pulang_Flag=pl.when(pl.col("Status_Pulang") == "Lupa Absen Pulang")
+                .then(1)
+                .otherwise(0)
+                .cast(pl.Int64)
+            )
+        else:
+            df_calc = df_calc.with_columns(Tidak_Absen_Pulang_Flag=pl.lit(0, dtype=pl.Int64))
+
     if "Overtime_Hours" not in df_calc.columns:
-        df_calc["Overtime_Hours"] = 0.0
+        df_calc = df_calc.with_columns(Overtime_Hours=pl.lit(0.0, dtype=pl.Float64))
 
-    summary = df_calc.groupby(["No.", "Name", "Department", "Employee_Type"], as_index=False).agg(
-        Total_Hari=("Tanggal", "size"),
-        Hari_Kerja=("Is_Working_Day", "sum"),
-        Hadir=("Present_Flag", "sum"),
-        Terlambat=("Late_Flag", "sum"),
-        Total_Menit_Telat=("Menit_Telat", "sum"),
-        Pulang_Cepat=("Early_Leave_Flag", "sum"),
-        Total_Menit_Pulang_Cepat=("Menit_Pulang_Cepat", "sum"),
-        Mangkir=("Absent_Flag", "sum"),
-        Lupa_Absen=("Forgot_Punch_Flag", "sum"),
-        Tidak_Absen_Pulang=("Tidak_Absen_Pulang_Flag", "sum"),
-        Total_Jam_Lembur=("Overtime_Hours", "sum"),
-        Anomali=("Is_Anomali", "sum"),
+    summary = df_calc.group_by(["No.", "Name", "Department", "Employee_Type"], maintain_order=True).agg(
+        Total_Hari=pl.len(),
+        Hari_Kerja=pl.col("Is_Working_Day").cast(pl.Int64).sum(),
+        Hadir=pl.col("Present_Flag").cast(pl.Int64).sum(),
+        Terlambat=pl.col("Late_Flag").cast(pl.Int64).sum(),
+        Total_Menit_Telat=pl.col("Menit_Telat").cast(pl.Int64).sum(),
+        Pulang_Cepat=pl.col("Early_Leave_Flag").cast(pl.Int64).sum(),
+        Total_Menit_Pulang_Cepat=pl.col("Menit_Pulang_Cepat").cast(pl.Int64).sum(),
+        Mangkir=pl.col("Absent_Flag").cast(pl.Int64).sum(),
+        Lupa_Absen=pl.col("Forgot_Punch_Flag").cast(pl.Int64).sum(),
+        Tidak_Absen_Pulang=pl.col("Tidak_Absen_Pulang_Flag").cast(pl.Int64).sum(),
+        Total_Jam_Lembur=pl.col("Overtime_Hours").cast(pl.Float64).sum(),
+        Anomali=pl.col("Is_Anomali").cast(pl.Int64).sum(),
     )
 
-    summary["Attendance_Rate_%"] = np.where(
-        summary["Hari_Kerja"] > 0, summary["Hadir"] / summary["Hari_Kerja"] * 100, 100.0
+    summary = summary.with_columns(
+        **{
+            "Attendance_Rate_%": pl.when(pl.col("Hari_Kerja") > 0)
+            .then(pl.col("Hadir") / pl.col("Hari_Kerja") * 100.0)
+            .otherwise(100.0),
+            "Punctuality_Rate_%": pl.when(pl.col("Hari_Kerja") > 0)
+            .then(
+                (
+                    (pl.col("Hari_Kerja") - pl.col("Terlambat") - pl.col("Mangkir"))
+                    / pl.col("Hari_Kerja")
+                    * 100.0
+                ).clip(0.0, 100.0)
+            )
+            .otherwise(100.0),
+        }
     )
-    summary["Punctuality_Rate_%"] = np.where(
-        summary["Hari_Kerja"] > 0,
-        (summary["Hari_Kerja"] - summary["Terlambat"] - summary["Mangkir"]) / summary["Hari_Kerja"] * 100,
-        100.0,
-    ).clip(min=0, max=100)
+
+    work = df_calc.filter(pl.col("Is_Working_Day"))
+    if not work.is_empty():
+        issue_days = (
+            work.group_by(["No.", "Tanggal"])
+            .agg(pl.col("Is_Anomali").max())
+            .group_by("No.")
+            .agg(pl.col("Is_Anomali").sum().alias("_Issue_Days"))
+        )
+        summary = summary.join(issue_days, on="No.", how="left")
+        summary = summary.with_columns(_Issue_Days=pl.col("_Issue_Days").fill_null(0))
+    else:
+        summary = summary.with_columns(_Issue_Days=pl.lit(0, dtype=pl.Int64))
+
+    summary = summary.with_columns(
+        Attendance_Score=pl.when(pl.col("Hari_Kerja") > 0)
+        .then(((1.0 - pl.col("_Issue_Days") / pl.col("Hari_Kerja")) * 100.0).clip(0.0, 100.0))
+        .otherwise(100.0)
+    ).drop("_Issue_Days")
+
+    classifications = [score_cfg.classify(s) for s in summary["Attendance_Score"].to_list()]
+    summary = summary.with_columns(HR_Classification=pl.Series("HR_Classification", classifications, dtype=pl.String))
+
+    return summary.sort(["Attendance_Score", "Department", "Name"])
+
+
+def calculate_department_summary(daily: pl.DataFrame) -> pl.DataFrame:
+    """Department-level roll-up KPI table."""
+    if daily.is_empty():
+        return pl.DataFrame()
+
+    work = daily.filter(pl.col("Is_Working_Day"))
+    if work.is_empty():
+        return pl.DataFrame()
+
+    out = work.group_by("Department", maintain_order=True).agg(
+        Employee=pl.col("No.").n_unique(),
+        Working_Days=pl.col("Tanggal").n_unique(),
+        Total_Man_Days=pl.col("Work_Day_Flag").cast(pl.Int64).sum(),
+        Present=pl.col("Present_Flag").cast(pl.Int64).sum(),
+        Late=pl.col("Late_Flag").cast(pl.Int64).sum(),
+        Absent=pl.col("Absent_Flag").cast(pl.Int64).sum(),
+        Early_Leave=pl.col("Early_Leave_Flag").cast(pl.Int64).sum(),
+        Late_Minutes=pl.col("Menit_Telat").cast(pl.Int64).sum(),
+        Anomalies=pl.col("Is_Anomali").cast(pl.Int64).sum(),
+    )
+
+    out = out.with_columns(
+        **{
+            "Attendance_Rate_%": pl.when(pl.col("Total_Man_Days") > 0)
+            .then(pl.col("Present") / pl.col("Total_Man_Days") * 100.0)
+            .otherwise(100.0)
+        }
+    )
 
     issue_days = (
-        work.groupby(["No.", "Tanggal"], as_index=False)["Is_Anomali"].max()
-        .groupby("No.", as_index=False)["Is_Anomali"].sum()
-        .rename(columns={"Is_Anomali": "_Issue_Days"})
+        work.group_by(["Department", "No.", "Tanggal"])
+        .agg(pl.col("Is_Anomali").max())
+        .group_by("Department")
+        .agg(pl.col("Is_Anomali").sum().alias("_Total_Issue_Days"))
     )
-    summary = summary.merge(issue_days, on="No.", how="left")
-    summary["_Issue_Days"] = summary["_Issue_Days"].fillna(0)
-    summary["Attendance_Score"] = np.clip(
-        np.where(
-            summary["Hari_Kerja"] > 0,
-            (1 - summary["_Issue_Days"] / summary["Hari_Kerja"]) * 100,
-            100.0,
-        ),
-        0,
-        100,
+    out = out.join(issue_days, on="Department", how="left")
+    out = out.with_columns(_Total_Issue_Days=pl.col("_Total_Issue_Days").fill_null(0))
+    out = out.with_columns(
+        **{
+            "Attendance_Score_%": pl.when(pl.col("Total_Man_Days") > 0)
+            .then(((1.0 - pl.col("_Total_Issue_Days") / pl.col("Total_Man_Days")) * 100.0).clip(0.0, 100.0))
+            .otherwise(100.0)
+        }
+    ).drop("_Total_Issue_Days")
+
+    return out.sort("Attendance_Score_%")
+
+
+def calculate_daily_trend(daily: pl.DataFrame) -> pl.DataFrame:
+    """Daily attendance trend table."""
+    if daily.is_empty():
+        return pl.DataFrame()
+
+    work = daily.filter(pl.col("Is_Working_Day"))
+    if work.is_empty():
+        return pl.DataFrame()
+
+    trend = work.group_by("Tanggal", maintain_order=True).agg(
+        Work_Days=pl.col("Work_Day_Flag").cast(pl.Int64).sum(),
+        Present=pl.col("Present_Flag").cast(pl.Int64).sum(),
+        Late=pl.col("Late_Flag").cast(pl.Int64).sum(),
+        Absent=pl.col("Absent_Flag").cast(pl.Int64).sum(),
+        Early_Leave=pl.col("Early_Leave_Flag").cast(pl.Int64).sum(),
+        Late_Minutes=pl.col("Menit_Telat").cast(pl.Int64).sum(),
     )
-    summary = summary.drop(columns=["_Issue_Days"])
-
-    summary["HR_Classification"] = summary["Attendance_Score"].map(score_cfg.classify)
-
-    return summary.sort_values(
-        ["Attendance_Score", "Department", "Name"], ascending=[True, True, True], kind="stable"
-    ).reset_index(drop=True)
-
-
-def calculate_department_summary(daily: pd.DataFrame) -> pd.DataFrame:
-    if daily.empty:
-        return pd.DataFrame()
-
-    work = daily[daily["Is_Working_Day"]].copy()
-    if work.empty:
-        return pd.DataFrame()
-
-    out = work.groupby("Department", as_index=False).agg(
-        Employee=("No.", "nunique"),
-        Work_Days=("Work_Day_Flag", "sum"),
-        Present=("Present_Flag", "sum"),
-        Late=("Late_Flag", "sum"),
-        Absent=("Absent_Flag", "sum"),
-        Early_Leave=("Early_Leave_Flag", "sum"),
-        Late_Minutes=("Menit_Telat", "sum"),
-        Anomalies=("Is_Anomali", "sum"),
+    trend = trend.with_columns(
+        **{
+            "Attendance_Rate_%": pl.when(pl.col("Work_Days") > 0)
+            .then(pl.col("Present") / pl.col("Work_Days") * 100.0)
+            .otherwise(100.0)
+        }
     )
-    out["Attendance_Rate_%"] = np.where(out["Work_Days"] > 0, out["Present"] / out["Work_Days"] * 100, 100)
-
-    issue_days = (
-        work.assign(_Issue_Day=work["Is_Anomali"].astype(int))
-        .groupby(["Department", "Tanggal"], as_index=False)["_Issue_Day"].max()
-        .groupby("Department", as_index=False)["_Issue_Day"].sum()
-        .rename(columns={"_Issue_Day": "_Issue_Days"})
-    )
-    out = out.merge(issue_days, on="Department", how="left")
-    out["_Issue_Days"] = out["_Issue_Days"].fillna(0)
-    out["Attendance_Score_%"] = (
-        100 - out["_Issue_Days"] / out["Work_Days"].replace(0, np.nan) * 100
-    ).fillna(100).clip(lower=0, upper=100)
-    out = out.drop(columns=["_Issue_Days"])
-    return out.sort_values("Attendance_Score_%").reset_index(drop=True)
+    return trend.sort("Tanggal")
 
 
-def calculate_daily_trend(daily: pd.DataFrame) -> pd.DataFrame:
-    if daily.empty:
-        return pd.DataFrame()
-
-    work = daily[daily["Is_Working_Day"]].copy()
-    trend = work.groupby("Tanggal", as_index=False).agg(
-        Work_Days=("Work_Day_Flag", "sum"),
-        Present=("Present_Flag", "sum"),
-        Late=("Late_Flag", "sum"),
-        Absent=("Absent_Flag", "sum"),
-        Early_Leave=("Early_Leave_Flag", "sum"),
-        Late_Minutes=("Menit_Telat", "sum"),
-    )
-    trend["Attendance_Rate_%"] = np.where(trend["Work_Days"] > 0, trend["Present"] / trend["Work_Days"] * 100, 100)
-    return trend
-
-
-def derive_hr_insights(summary: pd.DataFrame, dept: pd.DataFrame) -> list[str]:
+def derive_hr_insights(summary: pl.DataFrame, dept: pl.DataFrame) -> list[str]:
+    """Derive automated textual HR insights and priorities from analytics tables."""
     insights: list[str] = []
-    if summary.empty:
+    if summary.is_empty():
         return ["Belum ada data yang dapat dianalisis."]
 
-    worst = summary.nsmallest(5, "Attendance_Score")
-    if not worst.empty:
-        employee = worst.iloc[0]
+    worst = summary.sort("Attendance_Score").head(5)
+    if not worst.is_empty():
+        emp = worst.row(0, named=True)
         insights.append(
-            f"Prioritas HR: {employee['Name']} ({employee['Department']}) "
-            f"memiliki attendance score {employee['Attendance_Score']:.1f}%."
+            f"Prioritas HR: {emp['Name']} ({emp['Department']}) "
+            f"memiliki attendance score {emp['Attendance_Score']:.1f}%."
         )
 
-    late_minutes = int(summary["Total_Menit_Telat"].sum())
+    late_minutes = int(summary["Total_Menit_Telat"].sum()) if "Total_Menit_Telat" in summary.columns else 0
     if late_minutes:
         insights.append(
             f"Total keterlambatan mencapai {late_minutes:,} menit; "
             "pertimbangkan coaching berdasarkan pola departemen/hari."
         )
 
-    if not dept.empty:
-        d = dept.iloc[0]
+    if not dept.is_empty():
+        d = dept.row(0, named=True)
         insights.append(
             f"Departemen dengan attendance score terendah saat ini adalah "
             f"{d['Department']} ({d['Attendance_Score_%']:.1f}%)."
         )
 
-    high_absence = summary[summary["Mangkir"] > 0]
+    high_absence = summary.filter(pl.col("Mangkir") > 0) if "Mangkir" in summary.columns else pl.DataFrame()
     if len(high_absence):
         insights.append(f"{len(high_absence)} karyawan memiliki setidaknya satu hari mangkir.")
 
-    forgot = summary[summary["Lupa_Absen"] > 0]
+    forgot = summary.filter(pl.col("Lupa_Absen") > 0) if "Lupa_Absen" in summary.columns else pl.DataFrame()
     if len(forgot):
         insights.append(f"{len(forgot)} karyawan memiliki kejadian lupa absen masuk/pulang.")
 
     if "Tidak_Absen_Pulang" in summary.columns and "Employee_Type" in summary.columns:
-        sales_no_out = int(
-            summary.loc[summary["Employee_Type"] == "SALES", "Tidak_Absen_Pulang"].sum()
-        )
+        sales_subset = summary.filter(pl.col("Employee_Type") == "SALES")
+        sales_no_out = int(sales_subset["Tidak_Absen_Pulang"].sum()) if not sales_subset.is_empty() else 0
         if sales_no_out > 0:
             insights.append(
                 f"Anomali Sales: Terdeteksi {sales_no_out} kejadian tidak absen pulang pada tim Sales "

@@ -1,7 +1,8 @@
 import sys
-import pandas as pd
-
 import os
+import tempfile
+import polars as pl
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hrdash.attendance.parser import clean_attendance_data, clean_approved_leave
@@ -35,13 +36,13 @@ rows = [
     # 26/08 (Wed) no scan at all for EMP001 -> Mangkir
     ("Sales Mobil Baru", "Budi", "EMP001", "30/08/2026 09.00.00"),  # Sunday off -> holiday scan
 ]
-raw = pd.DataFrame(rows, columns=["Department", "Name", "No.", "Date/Time"])
+raw = pl.DataFrame(rows, schema=["Department", "Name", "No.", "Date/Time"], orient="row")
 
 clean, rejected, quality = clean_attendance_data(raw)
 print("quality:", quality)
 assert quality["valid_rows"] == len(raw)
 
-master_raw = pd.DataFrame(
+master_raw = pl.DataFrame(
     {
         "No.": ["EMP001", "12021007"],
         "Name": ["Budi Santoso", "Ani Lestari"],
@@ -56,50 +57,50 @@ master = load_employee_master(master_raw)
 print("\nmaster:\n", master)
 
 enriched, unmapped = merge_master_into_log(clean, master)
-print("\nunmapped:", unmapped.to_dict("records"))
+print("\nunmapped:", unmapped.to_dicts())
 
 cfg = AppConfig(attendance=AttendanceConfig(saturday_is_working=False))  # so 29/08 Sat is a holiday scan
 daily = att_engine.build_daily_attendance(enriched, cfg.attendance, holidays=None, approved_leave=None)
-print("\ndaily sample:\n", daily[["No.", "Tanggal", "Hari", "Status_Masuk", "Status_Pulang", "Scan_Count", "Anomaly_Type", "Severity"]].to_string())
+print("\ndaily sample:\n", daily.select(["No.", "Tanggal", "Hari", "Status_Masuk", "Status_Pulang", "Scan_Count", "Anomaly_Type", "Severity"]))
 
 # Sanity checks against the spec's worked example (Section 17)
-row_26 = daily[(daily["No."] == "12021007") & (daily["Tanggal"].astype(str) == "2026-08-26")].iloc[0]
+row_26 = daily.filter((pl.col("No.") == "12021007") & (pl.col("Tanggal").cast(pl.Utf8) == "2026-08-26")).row(0, named=True)
 assert row_26["Scan_Count"] == 1
 assert row_26["Status_Masuk"] == "Lupa Absen Masuk"  # single afternoon scan -> missing clock-in
 print("\n26/08 single-scan row ->", row_26["Status_Masuk"], row_26["Status_Pulang"], row_26["Anomaly_Type"], row_26["Severity"])
 
-row_28 = daily[(daily["No."] == "12021007") & (daily["Tanggal"].astype(str) == "2026-08-28")].iloc[0]
+row_28 = daily.filter((pl.col("No.") == "12021007") & (pl.col("Tanggal").cast(pl.Utf8) == "2026-08-28")).row(0, named=True)
 assert row_28["Scan_Count"] == 3
 assert row_28["Jam_Masuk"] == "07:54:08"
 assert row_28["Jam_Pulang"] == "17:24:34"
 print("28/08 triple-scan row ->", row_28["Jam_Masuk"], row_28["Jam_Pulang"], row_28["Anomaly_Type"])
 
-row_mangkir = daily[(daily["No."] == "EMP001") & (daily["Tanggal"].astype(str) == "2026-08-26")].iloc[0]
+row_mangkir = daily.filter((pl.col("No.") == "EMP001") & (pl.col("Tanggal").cast(pl.Utf8) == "2026-08-26")).row(0, named=True)
 print("EMP001 26/08 (no scan) ->", row_mangkir["Status_Masuk"], row_mangkir["Severity"])
 assert row_mangkir["Status_Masuk"] == "Mangkir"
 
-row_sun = daily[(daily["No."] == "EMP001") & (daily["Tanggal"].astype(str) == "2026-08-30")].iloc[0]
+row_sun = daily.filter((pl.col("No.") == "EMP001") & (pl.col("Tanggal").cast(pl.Utf8) == "2026-08-30")).row(0, named=True)
 print("EMP001 30/08 (Sunday off, scanned) ->", row_sun["Status_Masuk"], row_sun["Anomaly_Type"])
 assert row_sun["Anomaly_Type"] == "Scan Pada Hari Libur"
 
 employee_summary = att_analytics.calculate_employee_summary(daily, cfg.score)
 department_summary = att_analytics.calculate_department_summary(daily)
 trend = att_analytics.calculate_daily_trend(daily)
-anomalies = daily[daily["Is_Anomali"] == 1].copy()
+anomalies = daily.filter(pl.col("Is_Anomali") == 1)
 insights = att_analytics.derive_hr_insights(employee_summary, department_summary)
-print("\nemployee_summary:\n", employee_summary.to_string())
+print("\nemployee_summary:\n", employee_summary)
 print("\ninsights:", insights)
 
-# Payroll: without a configured rate, deductions must stay NA, not 0.
+# Payroll: without a configured rate, deductions must stay NA/null, not 0.
 payroll_unconfigured = calculate_payroll(employee_summary, master, PayrollConfig())
-assert payroll_unconfigured["Potongan_Telat"].isna().all()
-print("\npayroll (unconfigured rates):\n", payroll_unconfigured.to_string())
+assert payroll_unconfigured["Potongan_Telat"].is_null().all()
+print("\npayroll (unconfigured rates):\n", payroll_unconfigured)
 
 payroll_configured = calculate_payroll(
     employee_summary, master, PayrollConfig(late_deduction_per_minute=5000, absence_deduction_per_day=250000)
 )
-print("\npayroll (configured rates):\n", payroll_configured.to_string())
-assert not payroll_configured["Potongan_Telat"].isna().all()
+print("\npayroll (configured rates):\n", payroll_configured)
+assert not payroll_configured["Potongan_Telat"].is_null().all()
 
 # Test late deduction per occurrence & sales missing clock-out penalty
 payroll_occ = calculate_payroll(
@@ -109,12 +110,12 @@ payroll_occ = calculate_payroll(
         sales_no_clock_out_deduction=100000,
     )
 )
-print("\npayroll (per occurrence & sales penalty):\n", payroll_occ.to_string())
+print("\npayroll (per occurrence & sales penalty):\n", payroll_occ)
 assert "Jumlah_Tidak_Absen_Pulang" in payroll_occ.columns
 assert "Potongan_Lupa_Pulang_Sales" in payroll_occ.columns
 # EMP001 is SALES; non-sales should have 0 or NA for Potongan_Lupa_Pulang_Sales
-sales_row_p = payroll_occ[payroll_occ["No."] == "EMP001"].iloc[0]
-office_row_p = payroll_occ[payroll_occ["No."] == "12021007"].iloc[0]
+sales_row_p = payroll_occ.filter(pl.col("No.") == "EMP001").row(0, named=True)
+office_row_p = payroll_occ.filter(pl.col("No.") == "12021007").row(0, named=True)
 assert office_row_p["Potongan_Lupa_Pulang_Sales"] == 0.0
 
 # Multi-sheet leave template check
@@ -123,7 +124,7 @@ leave_tpl_bytes = build_leave_template()
 assert len(leave_tpl_bytes) > 0
 
 # Sales activity / performance (independent of fingerprint scans)
-sales_raw = pd.DataFrame(
+sales_raw = pl.DataFrame(
     {
         "No.": ["EMP001", "EMP001"],
         "Tanggal": ["21/08/2026", "22/08/2026"],
@@ -137,9 +138,9 @@ sales_raw = pd.DataFrame(
 )
 sales_activity = clean_sales_activity(sales_raw)
 sales_perf = calculate_sales_performance(sales_activity, master, cfg.sales_score)
-print("\nsales_performance:\n", sales_perf.to_string())
+print("\nsales_performance:\n", sales_perf)
 combined = combine_attendance_and_sales(employee_summary, sales_perf)
-print("\ncombined attendance+sales:\n", combined.to_string())
+print("\ncombined attendance+sales:\n", combined)
 
 # Config round-trip
 cfg_df = config_to_dataframe(cfg)
@@ -165,12 +166,13 @@ report = ReportData(
     report_period_label="2026-08-21 s/d 2026-08-29",
 )
 wb_bytes = generate_workbook(report)
-with open("/tmp/Laporan_HR_Test.xlsx", "wb") as f:
+temp_file_path = os.path.join(tempfile.gettempdir(), "Laporan_HR_Test.xlsx")
+with open(temp_file_path, "wb") as f:
     f.write(wb_bytes)
-print("\nWorkbook written:", len(wb_bytes), "bytes")
+print("\nWorkbook written:", len(wb_bytes), "bytes to", temp_file_path)
 
 from openpyxl import load_workbook
-wb = load_workbook("/tmp/Laporan_HR_Test.xlsx")
+wb = load_workbook(temp_file_path)
 print("Sheets:", wb.sheetnames)
 assert "DASHBOARD" in wb.sheetnames
 assert "CONFIG" in wb.sheetnames

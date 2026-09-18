@@ -12,10 +12,10 @@ a rate is missing (see ``hrdash.payroll``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from datetime import date, time
+from datetime import date, datetime, time
 from typing import Optional
 
-import pandas as pd
+import polars as pl
 
 CONFIG_SHEET_NAME = "CONFIG"
 
@@ -214,7 +214,7 @@ def _fmt_value(name: str, value) -> object:
     return value
 
 
-def config_to_dataframe(cfg: AppConfig) -> pd.DataFrame:
+def config_to_dataframe(cfg: AppConfig) -> pl.DataFrame:
     """Flatten AppConfig into a human-editable Parameter/Value table."""
     rows: list[dict] = []
     for section_name in ("attendance", "score", "payroll", "sales_score"):
@@ -224,11 +224,19 @@ def config_to_dataframe(cfg: AppConfig) -> pd.DataFrame:
                 {
                     "Section": _SECTION_LABELS[section_name],
                     "Parameter": f.name,
-                    "Value": _fmt_value(f.name, getattr(section_obj, f.name)),
+                    "Value": str(_fmt_value(f.name, getattr(section_obj, f.name))),
                     "Description": _FIELD_DESCRIPTIONS.get(f.name, ""),
                 }
             )
-    return pd.DataFrame(rows, columns=["Section", "Parameter", "Value", "Description"])
+    return pl.DataFrame(
+        rows,
+        schema={
+            "Section": pl.String,
+            "Parameter": pl.String,
+            "Value": pl.String,
+            "Description": pl.String,
+        },
+    )
 
 
 def _parse_value(name: str, raw: object):
@@ -241,9 +249,13 @@ def _parse_value(name: str, raw: object):
         parts = text.replace(".", ":").split(":")
         return time(int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
     if name in _DATE_FIELDS:
-        if isinstance(raw, date):
-            return raw
-        return pd.Timestamp(str(raw)).date()
+        if isinstance(raw, (date, datetime)):
+            return raw.date() if isinstance(raw, datetime) else raw
+        txt = str(raw).strip()[:10]
+        try:
+            return datetime.strptime(txt, "%Y-%m-%d").date()
+        except ValueError:
+            return None
     if name in _BOOL_FIELDS:
         if isinstance(raw, bool):
             return raw
@@ -258,7 +270,7 @@ def _parse_value(name: str, raw: object):
         return raw
 
 
-def config_from_dataframe(df: pd.DataFrame) -> AppConfig:
+def config_from_dataframe(df: pl.DataFrame | object) -> AppConfig:
     """Rebuild an AppConfig from a previously exported CONFIG sheet.
 
     Unknown or malformed rows are ignored; missing rows fall back to
@@ -267,7 +279,16 @@ def config_from_dataframe(df: pd.DataFrame) -> AppConfig:
     values: dict[str, dict] = {"attendance": {}, "score": {}, "payroll": {}, "sales_score": {}}
     section_by_label = {v: k for k, v in _SECTION_LABELS.items()}
 
-    for _, row in df.iterrows():
+    if isinstance(df, pl.DataFrame):
+        rows_iter = df.iter_rows(named=True)
+    elif hasattr(df, "to_dicts"):
+        rows_iter = df.to_dicts()
+    elif hasattr(df, "iterrows"):
+        rows_iter = (r.to_dict() for _, r in df.iterrows())
+    else:
+        rows_iter = []
+
+    for row in rows_iter:
         section_key = section_by_label.get(str(row.get("Section", "")).strip())
         param = str(row.get("Parameter", "")).strip()
         if not section_key or not param:

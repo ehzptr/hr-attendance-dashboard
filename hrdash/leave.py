@@ -17,7 +17,7 @@ from typing import Optional
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
-import pandas as pd
+import polars as pl
 
 NAVY = "1F4E78"
 WHITE = "FFFFFF"
@@ -421,15 +421,25 @@ def _load_kegiatan_bersama(ws, result: LeaveLoadResult) -> None:
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Enrichment Engine Integrator
 # --------------------------------------------------------------------------
 
-def apply_leave_kegiatan(daily: pd.DataFrame, leave_result: LeaveLoadResult | None) -> pd.DataFrame:
-    """Mengintegrasikan data Cuti, Lembur, dan Kegiatan Bersama ke DataFrame kehadiran utama."""
-    if daily is None or daily.empty or leave_result is None:
-        return daily.copy() if isinstance(daily, pd.DataFrame) else pd.DataFrame()
+def _ensure_polars(df: object) -> pl.DataFrame:
+    if isinstance(df, pl.DataFrame):
+        return df
+    if hasattr(df, "to_dict"):
+        return pl.from_pandas(df)
+    if isinstance(df, list):
+        return pl.DataFrame(df)
+    return pl.DataFrame(df)
 
-    out = daily.copy()
+
+def apply_leave_kegiatan(daily_input: pl.DataFrame | object, leave_result: LeaveLoadResult | None) -> pl.DataFrame:
+    """Mengintegrasikan data Cuti, Lembur, dan Kegiatan Bersama ke Polars DataFrame kehadiran utama."""
+    daily = _ensure_polars(daily_input)
+    if daily.is_empty() or leave_result is None:
+        return daily
 
     # Lookups
     leave_lookup = {(l.employee_id, d): l for l in leave_result.leaves for d in l.dates()}
@@ -450,21 +460,14 @@ def apply_leave_kegiatan(daily: pd.DataFrame, leave_result: LeaveLoadResult | No
         for d in e.dates()
     }
 
-    id_col = "No." if "No." in out.columns else "Employee_ID"
-    date_col = "Tanggal" if "Tanggal" in out.columns else "Date"
+    id_col = "No." if "No." in daily.columns else "Employee_ID"
+    date_col = "Tanggal" if "Tanggal" in daily.columns else "Date"
 
-    if "Leave_Type" not in out.columns:
-        out["Leave_Type"] = pd.NA
-    if "Overtime_Hours" not in out.columns:
-        out["Overtime_Hours"] = 0.0
-    if "Overtime_Status" not in out.columns:
-        out["Overtime_Status"] = pd.NA
-    if "Group_Event" not in out.columns:
-        out["Group_Event"] = pd.NA
+    rows = daily.to_dicts()
 
-    for idx, row in out.iterrows():
-        emp_id = str(row[id_col]).strip()
-        the_date = _to_date(row[date_col])
+    for row in rows:
+        emp_id = str(row.get(id_col, "")).strip()
+        the_date = _to_date(row.get(date_col))
         if not emp_id or the_date is None:
             continue
 
@@ -473,109 +476,109 @@ def apply_leave_kegiatan(daily: pd.DataFrame, leave_result: LeaveLoadResult | No
         # Overtime Individual
         ot_entries = ot_lookup.get((emp_id, the_date), [])
         if ot_entries:
-            out.at[idx, "Overtime_Hours"] = round(sum(o.duration_hours for o in ot_entries), 2)
-            out.at[idx, "Overtime_Status"] = "Approved"
+            row["Overtime_Hours"] = round(sum(o.duration_hours for o in ot_entries), 2)
+            row["Overtime_Status"] = "Approved"
 
         # 1. Libur Bersama (Global)
         if the_date in holiday_events:
             event = holiday_events[the_date]
-            out.at[idx, "Group_Event"] = event.name
-            if "Absent_Flag" in out.columns:
-                out.at[idx, "Absent_Flag"] = 0
+            row["Group_Event"] = event.name
+            if "Absent_Flag" in row:
+                row["Absent_Flag"] = 0
             if not has_scan:
-                if "Status_Masuk" in out.columns:
-                    out.at[idx, "Status_Masuk"] = "Libur Bersama"
-                if "Status_Pulang" in out.columns:
-                    out.at[idx, "Status_Pulang"] = "Libur Bersama"
-                if "Menit_Telat" in out.columns:
-                    out.at[idx, "Menit_Telat"] = 0
-                if "Menit_Pulang_Cepat" in out.columns:
-                    out.at[idx, "Menit_Pulang_Cepat"] = 0
-                if "Anomaly_Type" in out.columns:
-                    out.at[idx, "Anomaly_Type"] = ""
-                if "Severity" in out.columns:
-                    out.at[idx, "Severity"] = ""
-                if "Is_Anomali" in out.columns:
-                    out.at[idx, "Is_Anomali"] = 0
-                if "Late_Flag" in out.columns:
-                    out.at[idx, "Late_Flag"] = 0
-                if "Early_Leave_Flag" in out.columns:
-                    out.at[idx, "Early_Leave_Flag"] = 0
-                if "Forgot_Punch_Flag" in out.columns:
-                    out.at[idx, "Forgot_Punch_Flag"] = 0
-                if "Tidak_Absen_Pulang_Flag" in out.columns:
-                    out.at[idx, "Tidak_Absen_Pulang_Flag"] = 0
+                if "Status_Masuk" in row:
+                    row["Status_Masuk"] = "Libur Bersama"
+                if "Status_Pulang" in row:
+                    row["Status_Pulang"] = "Libur Bersama"
+                if "Menit_Telat" in row:
+                    row["Menit_Telat"] = 0
+                if "Menit_Pulang_Cepat" in row:
+                    row["Menit_Pulang_Cepat"] = 0
+                if "Anomaly_Type" in row:
+                    row["Anomaly_Type"] = ""
+                if "Severity" in row:
+                    row["Severity"] = ""
+                if "Is_Anomali" in row:
+                    row["Is_Anomali"] = 0
+                if "Late_Flag" in row:
+                    row["Late_Flag"] = 0
+                if "Early_Leave_Flag" in row:
+                    row["Early_Leave_Flag"] = 0
+                if "Forgot_Punch_Flag" in row:
+                    row["Forgot_Punch_Flag"] = 0
+                if "Tidak_Absen_Pulang_Flag" in row:
+                    row["Tidak_Absen_Pulang_Flag"] = 0
             continue
 
         # 2. Approved Cuti (Individual)
         leave = leave_lookup.get((emp_id, the_date))
         if leave:
-            out.at[idx, "Leave_Type"] = leave.leave_type
-            if "Absent_Flag" in out.columns:
-                out.at[idx, "Absent_Flag"] = 0
+            row["Leave_Type"] = leave.leave_type
+            if "Absent_Flag" in row:
+                row["Absent_Flag"] = 0
             if not has_scan:
-                if "Status_Masuk" in out.columns:
-                    out.at[idx, "Status_Masuk"] = "Cuti Disetujui"
-                if "Status_Pulang" in out.columns:
-                    out.at[idx, "Status_Pulang"] = leave.leave_type
-                if "Menit_Telat" in out.columns:
-                    out.at[idx, "Menit_Telat"] = 0
-                if "Menit_Pulang_Cepat" in out.columns:
-                    out.at[idx, "Menit_Pulang_Cepat"] = 0
-                if "Anomaly_Type" in out.columns:
-                    out.at[idx, "Anomaly_Type"] = ""
-                if "Severity" in out.columns:
-                    out.at[idx, "Severity"] = ""
-                if "Is_Anomali" in out.columns:
-                    out.at[idx, "Is_Anomali"] = 0
-                if "Late_Flag" in out.columns:
-                    out.at[idx, "Late_Flag"] = 0
-                if "Early_Leave_Flag" in out.columns:
-                    out.at[idx, "Early_Leave_Flag"] = 0
-                if "Forgot_Punch_Flag" in out.columns:
-                    out.at[idx, "Forgot_Punch_Flag"] = 0
-                if "Tidak_Absen_Pulang_Flag" in out.columns:
-                    out.at[idx, "Tidak_Absen_Pulang_Flag"] = 0
+                if "Status_Masuk" in row:
+                    row["Status_Masuk"] = "Cuti Disetujui"
+                if "Status_Pulang" in row:
+                    row["Status_Pulang"] = leave.leave_type
+                if "Menit_Telat" in row:
+                    row["Menit_Telat"] = 0
+                if "Menit_Pulang_Cepat" in row:
+                    row["Menit_Pulang_Cepat"] = 0
+                if "Anomaly_Type" in row:
+                    row["Anomaly_Type"] = ""
+                if "Severity" in row:
+                    row["Severity"] = ""
+                if "Is_Anomali" in row:
+                    row["Is_Anomali"] = 0
+                if "Late_Flag" in row:
+                    row["Late_Flag"] = 0
+                if "Early_Leave_Flag" in row:
+                    row["Early_Leave_Flag"] = 0
+                if "Forgot_Punch_Flag" in row:
+                    row["Forgot_Punch_Flag"] = 0
+                if "Tidak_Absen_Pulang_Flag" in row:
+                    row["Tidak_Absen_Pulang_Flag"] = 0
             continue
 
         # 3. Lembur Bersama (Global - e.g. pameran launching mall)
         if the_date in overtime_events:
             event = overtime_events[the_date]
-            out.at[idx, "Group_Event"] = event.name
-            current_ot = float(out.at[idx, "Overtime_Hours"] or 0.0)
-            out.at[idx, "Overtime_Hours"] = round(current_ot + (event.duration_hours or 8.0), 2)
-            out.at[idx, "Overtime_Status"] = "Approved"
+            row["Group_Event"] = event.name
+            current_ot = float(row.get("Overtime_Hours") or 0.0)
+            row["Overtime_Hours"] = round(current_ot + (event.duration_hours or 8.0), 2)
+            row["Overtime_Status"] = "Approved"
 
             # Karyawan ikut pameran/event sehingga tidak absen di kantor -> TIDAK MANGKIR!
             if not has_scan:
-                if "Absent_Flag" in out.columns:
-                    out.at[idx, "Absent_Flag"] = 0
-                if "Status_Masuk" in out.columns:
-                    out.at[idx, "Status_Masuk"] = "Lembur Bersama"
-                if "Status_Pulang" in out.columns:
-                    out.at[idx, "Status_Pulang"] = "Lembur Bersama"
-                if "Menit_Telat" in out.columns:
-                    out.at[idx, "Menit_Telat"] = 0
-                if "Menit_Pulang_Cepat" in out.columns:
-                    out.at[idx, "Menit_Pulang_Cepat"] = 0
-                if "Anomaly_Type" in out.columns:
-                    out.at[idx, "Anomaly_Type"] = ""
-                if "Severity" in out.columns:
-                    out.at[idx, "Severity"] = ""
-                if "Is_Anomali" in out.columns:
-                    out.at[idx, "Is_Anomali"] = 0
-                if "Late_Flag" in out.columns:
-                    out.at[idx, "Late_Flag"] = 0
-                if "Early_Leave_Flag" in out.columns:
-                    out.at[idx, "Early_Leave_Flag"] = 0
-                if "Forgot_Punch_Flag" in out.columns:
-                    out.at[idx, "Forgot_Punch_Flag"] = 0
-                if "Tidak_Absen_Pulang_Flag" in out.columns:
-                    out.at[idx, "Tidak_Absen_Pulang_Flag"] = 0
-                if "Present_Flag" in out.columns:
-                    out.at[idx, "Present_Flag"] = 1
+                if "Absent_Flag" in row:
+                    row["Absent_Flag"] = 0
+                if "Status_Masuk" in row:
+                    row["Status_Masuk"] = "Lembur Bersama"
+                if "Status_Pulang" in row:
+                    row["Status_Pulang"] = "Lembur Bersama"
+                if "Menit_Telat" in row:
+                    row["Menit_Telat"] = 0
+                if "Menit_Pulang_Cepat" in row:
+                    row["Menit_Pulang_Cepat"] = 0
+                if "Anomaly_Type" in row:
+                    row["Anomaly_Type"] = ""
+                if "Severity" in row:
+                    row["Severity"] = ""
+                if "Is_Anomali" in row:
+                    row["Is_Anomali"] = 0
+                if "Late_Flag" in row:
+                    row["Late_Flag"] = 0
+                if "Early_Leave_Flag" in row:
+                    row["Early_Leave_Flag"] = 0
+                if "Forgot_Punch_Flag" in row:
+                    row["Forgot_Punch_Flag"] = 0
+                if "Tidak_Absen_Pulang_Flag" in row:
+                    row["Tidak_Absen_Pulang_Flag"] = 0
+                if "Present_Flag" in row:
+                    row["Present_Flag"] = 1
 
-    return out
+    return pl.DataFrame(rows, schema=daily.schema)
 
 
 # --------------------------------------------------------------------------
@@ -592,29 +595,39 @@ def _row_is_blank(row: tuple) -> bool:
     return all(_is_blank(v) for v in row)
 
 def _to_date(val: object) -> Optional[dt.date]:
-    if val is None or pd.isna(val):
+    if val is None:
         return None
-    if isinstance(val, (dt.datetime, pd.Timestamp)):
+    if isinstance(val, dt.datetime):
         return val.date()
     if isinstance(val, dt.date):
         return val
-    try:
-        return pd.to_datetime(str(val).strip(), dayfirst=True).date()
-    except Exception:
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none", "nat", "<null>"):
         return None
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(s[:10], fmt).date()
+        except ValueError:
+            pass
+    return None
 
 def _to_time(val: object) -> Optional[dt.time]:
-    if val is None or pd.isna(val):
+    if val is None:
         return None
     if isinstance(val, dt.datetime):
         return val.time()
     if isinstance(val, dt.time):
         return val
-    try:
-        txt = str(val).strip().replace(".", ":")
-        return pd.to_datetime(txt).time()
-    except Exception:
+    s = str(val).strip().replace(".", ":")
+    if not s or s.lower() in ("nan", "none", "nat", "<null>"):
         return None
+    parts = s.split(":")
+    if len(parts) >= 2:
+        try:
+            return dt.time(int(parts[0]), int(parts[1]))
+        except ValueError:
+            return None
+    return None
 
 def _hours_between(start: dt.time, end: dt.time) -> float:
     s = start.hour + start.minute / 60.0

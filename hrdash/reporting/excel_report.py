@@ -1,19 +1,18 @@
 """
-Excel workbook generator.
+Comprehensive Excel report generator (Section 13).
 
-Produces the eleven-sheet workbook described in Section 10:
-DASHBOARD, CONFIG, EMPLOYEE_MASTER, RAW_LOG, DAILY_ATTENDANCE,
-EMPLOYEE_SUMMARY, ANOMALY, PAYROLL, SALES_PERFORMANCE, Sales_Activity,
-README. The dashboard sheet is a decision-making surface (KPI cards +
-priority tables + native Excel charts), not a dump of every column.
+Renders the complete audit package — from the executive dashboard with
+KPI cards and native openpyxl charts down to the verbatim audit trail of
+raw scans and rejected rows.
 """
 
 from __future__ import annotations
 
 import io
 from dataclasses import dataclass
+from typing import Optional
 
-import pandas as pd
+import polars as pl
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -23,34 +22,39 @@ from openpyxl.worksheet.worksheet import Worksheet
 from ..config import AppConfig, config_to_dataframe
 
 NAVY = "1F4E78"
-ACCENT_BLUE = "2E75B6"
-LIGHT_BLUE = "D9EAF7"
+DARK_SLATE = "2F5597"
+ACCENT_BLUE = "D9E1F2"
 LIGHT_GRAY = "F2F2F2"
 WHITE = "FFFFFF"
-GREEN = "2E7D32"
-AMBER = "B7791F"
-RED = "C0392B"
+BORDER_GRAY = "D9D9D9"
 
-HEADER_FONT = Font(name="Aptos", bold=True, color=WHITE, size=10)
 HEADER_FILL = PatternFill("solid", fgColor=NAVY)
-TITLE_FONT = Font(name="Aptos", bold=True, size=16, color=NAVY)
-SUBTITLE_FONT = Font(name="Aptos", size=10, color="595959", italic=True)
+HEADER_FONT = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
+SECTION_FILL = PatternFill("solid", fgColor=DARK_SLATE)
+SECTION_FONT = Font(name="Segoe UI", size=11, bold=True, color=WHITE)
+CARD_VALUE_FONT = Font(name="Segoe UI", size=20, bold=True, color=NAVY)
+CARD_LABEL_FONT = Font(name="Segoe UI", size=9, bold=False, color="595959")
+INSIGHT_FONT = Font(name="Segoe UI", size=10, italic=False, color="1F4E78")
+INSIGHT_HEADER_FONT = Font(name="Segoe UI", size=11, bold=True, color=NAVY)
+
+THIN_SIDE = Side(border_style="thin", color=BORDER_GRAY)
+CARD_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
 
 
 @dataclass
 class ReportData:
     config: AppConfig
-    employee_master: pd.DataFrame
-    raw_log: pd.DataFrame
-    daily_attendance: pd.DataFrame
-    employee_summary: pd.DataFrame
-    department_summary: pd.DataFrame
-    daily_trend: pd.DataFrame
-    anomalies: pd.DataFrame
-    rejected: pd.DataFrame
-    payroll: pd.DataFrame
-    sales_activity: pd.DataFrame
-    sales_performance: pd.DataFrame
+    employee_master: pl.DataFrame
+    raw_log: pl.DataFrame
+    daily_attendance: pl.DataFrame
+    employee_summary: pl.DataFrame
+    department_summary: pl.DataFrame
+    daily_trend: pl.DataFrame
+    anomalies: pl.DataFrame
+    rejected: pl.DataFrame
+    payroll: pl.DataFrame
+    sales_activity: pl.DataFrame
+    sales_performance: pl.DataFrame
     insights: list[str]
     report_period_label: str = ""
 
@@ -60,10 +64,10 @@ class ReportData:
 # ---------------------------------------------------------------------------
 
 
-def _write_table(ws: Worksheet, df: pd.DataFrame, start_row: int = 1, start_col: int = 1) -> tuple[int, int]:
+def _write_table(ws: Worksheet, df: Optional[pl.DataFrame], start_row: int = 1, start_col: int = 1) -> tuple[int, int]:
     """Write a styled table starting at (start_row, start_col). Returns the
     (last_row, last_col) written."""
-    if df is None or df.empty:
+    if df is None or df.is_empty():
         cell = ws.cell(row=start_row, column=start_col, value="(Tidak ada data)")
         cell.font = Font(italic=True, color="7F7F7F")
         return start_row, start_col
@@ -74,14 +78,9 @@ def _write_table(ws: Worksheet, df: pd.DataFrame, start_row: int = 1, start_col:
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for i, (_, row) in enumerate(df.iterrows(), start=1):
+    for i, row in enumerate(df.iter_rows(named=False), start=1):
         for j, value in enumerate(row):
-            v = value
-            if pd.isna(v):
-                v = None
-            elif hasattr(v, "isoformat"):
-                v = v
-            cell = ws.cell(row=start_row + i, column=start_col + j, value=v)
+            cell = ws.cell(row=start_row + i, column=start_col + j, value=value)
             if i % 2 == 0:
                 cell.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
 
@@ -105,7 +104,7 @@ def _autofit(ws: Worksheet, max_scan_row: int = 2000) -> None:
         ws.column_dimensions[letter].width = min(max(longest + 2, 10), 42)
 
 
-def _data_sheet(wb: Workbook, name: str, df: pd.DataFrame) -> Worksheet:
+def _data_sheet(wb: Workbook, name: str, df: Optional[pl.DataFrame]) -> Worksheet:
     ws = wb.create_sheet(name)
     ws.sheet_view.showGridLines = False
     _write_table(ws, df)
@@ -120,140 +119,151 @@ def _data_sheet(wb: Workbook, name: str, df: pd.DataFrame) -> Worksheet:
 
 def _kpi_card(ws: Worksheet, row: int, col: int, label: str, value: str, accent: str = ACCENT_BLUE) -> None:
     label_cell = ws.cell(row=row, column=col, value=label)
-    label_cell.font = Font(name="Aptos", size=9, color="595959")
-    label_cell.alignment = Alignment(horizontal="left")
+    label_cell.font = CARD_LABEL_FONT
+    label_cell.alignment = Alignment(horizontal="center", vertical="center")
+    label_cell.fill = PatternFill("solid", fgColor=accent)
+    label_cell.border = CARD_BORDER
 
-    value_cell = ws.cell(row=row + 1, column=col, value=value)
-    value_cell.font = Font(name="Aptos", size=20, bold=True, color=accent)
-    value_cell.alignment = Alignment(horizontal="left")
-
-    for r in (row, row + 1):
-        c = ws.cell(row=r, column=col)
-        c.fill = PatternFill("solid", fgColor=LIGHT_GRAY)
-        c.border = Border(
-            left=Side(style="thin", color="D9D9D9"),
-            top=Side(style="thin", color="D9D9D9") if r == row else None,
-            bottom=Side(style="thin", color="D9D9D9") if r == row + 1 else None,
-        )
-    ws.row_dimensions[row].height = 16
-    ws.row_dimensions[row + 1].height = 26
+    val_cell = ws.cell(row=row + 1, column=col, value=value)
+    val_cell.font = CARD_VALUE_FONT
+    val_cell.alignment = Alignment(horizontal="center", vertical="center")
+    val_cell.border = CARD_BORDER
 
 
-def _section_title(ws: Worksheet, row: int, col: int, text: str) -> None:
-    cell = ws.cell(row=row, column=col, value=text)
-    cell.font = Font(name="Aptos", bold=True, size=12, color=NAVY)
+def _section_title(ws: Worksheet, row: int, col: int, text: str, span: int = 6) -> None:
+    for c in range(col, col + span):
+        cell = ws.cell(row=row, column=c)
+        cell.fill = SECTION_FILL
+    title_cell = ws.cell(row=row, column=col, value=text)
+    title_cell.font = SECTION_FONT
+    title_cell.alignment = Alignment(vertical="center")
+    ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + span - 1)
 
 
 # ---------------------------------------------------------------------------
-# DASHBOARD sheet
+# Dashboard builder
 # ---------------------------------------------------------------------------
 
 
 def _build_dashboard(wb: Workbook, data: ReportData) -> None:
-    ws = wb.create_sheet("DASHBOARD", 0)
+    ws = wb.create_sheet("DASHBOARD")
     ws.sheet_view.showGridLines = False
 
-    ws.merge_cells("A1:H1")
-    ws["A1"] = "HR Attendance, Payroll & Sales Performance Dashboard"
-    ws["A1"].font = TITLE_FONT
-    ws.merge_cells("A2:H2")
-    period = data.report_period_label or "Seluruh periode data"
-    ws["A2"] = f"Periode: {period}"
-    ws["A2"].font = SUBTITLE_FONT
+    # Title block
+    ws.merge_cells("A1:K1")
+    title = ws.cell(row=1, column=1, value="DEALERSHIP HR & SALES PERFORMANCE DASHBOARD")
+    title.font = Font(name="Segoe UI", size=14, bold=True, color=WHITE)
+    title.fill = HEADER_FILL
+    title.alignment = Alignment(vertical="center", indent=1)
+    ws.row_dimensions[1].height = 28
 
-    daily = data.daily_attendance
-    emp_summary = data.employee_summary
-    total_employees = int(daily["No."].nunique()) if not daily.empty else 0
-    working = int(daily["Is_Working_Day"].sum()) if not daily.empty else 0
-    present = int(daily["Present_Flag"].sum()) if not daily.empty else 0
-    attendance_rate = (present / working * 100) if working else 0.0
-    total_late = int(daily["Late_Flag"].sum()) if not daily.empty else 0
-    total_absent = int(daily["Absent_Flag"].sum()) if not daily.empty else 0
+    if data.report_period_label:
+        ws.merge_cells("A2:K2")
+        sub = ws.cell(row=2, column=1, value=f"Periode Laporan: {data.report_period_label}")
+        sub.font = Font(name="Segoe UI", size=10, italic=True, color="595959")
 
-    kpis = [
-        ("Total Karyawan", f"{total_employees:,}", ACCENT_BLUE),
-        ("Attendance Rate", f"{attendance_rate:.1f}%", GREEN if attendance_rate >= 90 else AMBER),
-        ("Total Terlambat", f"{total_late:,}", AMBER if total_late else GREEN),
-        ("Total Mangkir", f"{total_absent:,}", RED if total_absent else GREEN),
-    ]
-    for i, (label, value, accent) in enumerate(kpis):
-        _kpi_card(ws, 4, 1 + i * 2, label, value, accent)
+    # KPI summary numbers
+    summary = data.employee_summary
+    total_emp = summary["No."].n_unique() if not summary.is_empty() else 0
+    total_late = int(summary["Terlambat"].sum()) if not summary.is_empty() and "Terlambat" in summary.columns else 0
+    total_absent = int(summary["Mangkir"].sum()) if not summary.is_empty() and "Mangkir" in summary.columns else 0
+    avg_score = summary["Attendance_Score"].mean() if not summary.is_empty() and "Attendance_Score" in summary.columns else 100.0
 
-    row = 8
-    _section_title(ws, row, 1, "Perlu Perhatian HR (Attendance Score Terendah)")
-    row += 1
-    if not emp_summary.empty:
-        watch = emp_summary.nsmallest(10, "Attendance_Score")[
-            ["No.", "Name", "Department", "Terlambat", "Mangkir", "Attendance_Score", "HR_Classification"]
-        ]
-        last_row, last_col = _write_table(ws, watch, start_row=row, start_col=1)
-    else:
-        ws.cell(row=row, column=1, value="(Tidak ada data)")
-        last_row = row
+    sales_perf = data.sales_performance
+    total_spk = int(sales_perf["SPK"].sum()) if not sales_perf.is_empty() and "SPK" in sales_perf.columns else 0
+    total_delivery = int(sales_perf["Delivery"].sum()) if not sales_perf.is_empty() and "Delivery" in sales_perf.columns else 0
+    total_revenue = float(sales_perf["Revenue"].sum()) if not sales_perf.is_empty() and "Revenue" in sales_perf.columns else 0.0
 
-    sales_row = 8
+    card_row = 4
+    _kpi_card(ws, card_row, 1, "Total Karyawan", str(total_emp))
+    _kpi_card(ws, card_row, 3, "Avg Attendance Score", f"{avg_score:.1f}%")
+    _kpi_card(ws, card_row, 5, "Total Kejadian Telat", str(total_late))
+    _kpi_card(ws, card_row, 7, "Total Kejadian Mangkir", str(total_absent))
+    _kpi_card(ws, card_row, 9, "Total SPK Sales", str(total_spk))
+    _kpi_card(ws, card_row, 11, "Total Delivery Sales", str(total_delivery))
+
+    # Automated HR Insights section
+    insight_row = 8
+    _section_title(ws, insight_row, 1, "Rangkuman Insight Otomatis (HR & Sales Highlights)", span=11)
+    ws.row_dimensions[insight_row].height = 20
+    for idx, text in enumerate(data.insights, start=1):
+        r = insight_row + idx
+        c = ws.cell(row=r, column=1, value=f"\u2022 {text}")
+        c.font = INSIGHT_FONT
+        c.alignment = Alignment(vertical="center")
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=11)
+
+    # Tables: Watchlist (top anomalies) + Sales Leaderboard
+    table_start_row = insight_row + len(data.insights) + 2
+
+    # Watchlist: 5 lowest Attendance_Score
+    _section_title(ws, table_start_row, 1, "Perhatian Khusus: 5 Karyawan Skor Terendah", span=5)
+    watch_cols = ["No.", "Name", "Department", "Attendance_Score", "Terlambat", "Mangkir"]
+    avail_watch = [c for c in watch_cols if c in summary.columns] if not summary.is_empty() else []
+    watch = summary.sort("Attendance_Score").head(5).select(avail_watch) if avail_watch else pl.DataFrame()
+    row = table_start_row + 1
+    last_row, last_col = _write_table(ws, watch, start_row=row, start_col=1)
+
+    # Top 5 Sales
     sales_col = 7
-    if not data.sales_performance.empty:
-        _section_title(ws, sales_row, sales_col, "Top Sales Performance")
-        sales_row += 1
-        top_sales = data.sales_performance.head(10)[
-            ["No.", "Name", "SPK", "Delivery", "Revenue", "Performance_Score", "Performance_Classification"]
-        ]
-        _write_table(ws, top_sales, start_row=sales_row, start_col=sales_col)
+    _section_title(ws, table_start_row, sales_col, "Top Performa Sales", span=5)
+    sales_cols = ["No.", "Name", "SPK", "Delivery", "Performance_Score"]
+    avail_sales = [c for c in sales_cols if c in sales_perf.columns] if not sales_perf.is_empty() else []
+    top_sales = sales_perf.sort("Performance_Score", descending=True).head(5).select(avail_sales) if avail_sales else pl.DataFrame()
+    sales_row = table_start_row + 1
+    _write_table(ws, top_sales, start_row=sales_row, start_col=sales_col)
 
-    insight_row = last_row + 3
-    _section_title(ws, insight_row, 1, "Insight HR")
-    insight_row += 1
-    for text in data.insights:
-        ws.cell(row=insight_row, column=1, value=f"• {text}")
-        ws.merge_cells(start_row=insight_row, start_column=1, end_row=insight_row, end_column=8)
-        ws.cell(row=insight_row, column=1).alignment = Alignment(wrap_text=True)
-        insight_row += 1
-
-    # --- Trend chart data block (kept off to the side, used only as the
-    # chart's data source) ---
-    chart_row = insight_row + 2
-    _section_title(ws, chart_row, 1, "Trend Kehadiran Harian")
-    data_start = chart_row + 1
+    # Daily Trend Chart
     trend = data.daily_trend
-    if not trend.empty:
-        _write_table(ws, trend[["Tanggal", "Attendance_Rate_%", "Late", "Absent"]], start_row=data_start, start_col=1)
+    if not trend.is_empty():
+        chart_section_row = max(last_row, sales_row + len(top_sales)) + 3
+        _section_title(ws, chart_section_row, 1, "Trend Kehadiran Harian", span=11)
+        data_start = chart_section_row + 1
+        trend_cols = ["Tanggal", "Work_Days", "Present", "Late", "Absent", "Early_Leave"]
+        avail_trend = [c for c in trend_cols if c in trend.columns]
+        _write_table(ws, trend.select(avail_trend), start_row=data_start, start_col=1)
+
+        # Line chart for Trend
         n = len(trend)
+        chart = LineChart()
+        chart.title = "Trend Hadir vs Terlambat vs Mangkir"
+        chart.style = 13
+        chart.y_axis.title = "Jumlah Orang"
+        chart.x_axis.title = "Tanggal"
+        chart.height = 12
+        chart.width = 22
 
-        line = LineChart()
-        line.title = "Attendance Rate Harian (%)"
-        line.y_axis.title = "%"
-        line.y_axis.scaling.min = 0
-        line.y_axis.scaling.max = 100
-        line.height = 8
-        line.width = 22
         cats = Reference(ws, min_col=1, min_row=data_start + 1, max_row=data_start + n)
-        vals = Reference(ws, min_col=2, min_row=data_start, max_row=data_start + n)
-        line.add_data(vals, titles_from_data=True)
-        line.set_categories(cats)
-        ws.add_chart(line, f"F{data_start}")
+        vals = Reference(ws, min_col=3, max_col=min(5, len(avail_trend)), min_row=data_start, max_row=data_start + n)
+        chart.add_data(vals, titles_from_data=True)
+        chart.set_categories(cats)
+        ws.add_chart(chart, f"G{data_start}")
 
+        # Bar chart for Late vs Absent
         bar = BarChart()
         bar.type = "col"
-        bar.title = "Terlambat vs Mangkir Harian"
+        bar.title = "Perbandingan Terlambat vs Mangkir"
         bar.height = 8
         bar.width = 22
-        vals2 = Reference(ws, min_col=3, max_col=4, min_row=data_start, max_row=data_start + n)
+        vals2 = Reference(ws, min_col=4, max_col=5, min_row=data_start, max_row=data_start + n)
         bar.add_data(vals2, titles_from_data=True)
         bar.set_categories(cats)
-        ws.add_chart(bar, f"F{data_start + 17}")
+        ws.add_chart(bar, f"G{data_start + 17}")
 
-    if not data.department_summary.empty:
+    dept_summary = data.department_summary
+    if not dept_summary.is_empty():
         dept_chart_row = data_start + len(trend) + 35
         _section_title(ws, dept_chart_row, 1, "Attendance Score per Departemen")
         dept_data_row = dept_chart_row + 1
+        dept_cols = ["Department", "Attendance_Score_%"]
+        avail_dept = [c for c in dept_cols if c in dept_summary.columns]
         _write_table(
             ws,
-            data.department_summary[["Department", "Attendance_Score_%"]],
+            dept_summary.select(avail_dept),
             start_row=dept_data_row,
             start_col=1,
         )
-        n = len(data.department_summary)
+        n = len(dept_summary)
         dept_bar = BarChart()
         dept_bar.type = "bar"
         dept_bar.title = "Attendance Score per Departemen"
@@ -263,21 +273,25 @@ def _build_dashboard(wb: Workbook, data: ReportData) -> None:
         vals = Reference(ws, min_col=2, min_row=dept_data_row, max_row=dept_data_row + n)
         dept_bar.add_data(vals, titles_from_data=True)
         dept_bar.set_categories(cats)
-        ws.add_chart(dept_bar, f"F{dept_data_row}")
+        ws.add_chart(dept_bar, f"G{dept_data_row}")
 
-    for col, width in {"A": 14, "B": 20, "C": 16, "D": 12, "E": 12, "F": 16, "G": 14, "H": 16}.items():
-        ws.column_dimensions[col].width = width
+    _autofit(ws, max_scan_row=30)
 
 
 # ---------------------------------------------------------------------------
-# README sheet
+# README / Metadata Sheet
 # ---------------------------------------------------------------------------
+
 
 README_ROWS = [
-    ("PANDUAN WORKBOOK", ""),
-    ("DASHBOARD", "Ringkasan eksekutif: KPI utama, karyawan yang perlu perhatian HR, top sales, dan trend."),
-    ("CONFIG", "Semua aturan bisnis (jadwal, toleransi, opsi potongan telat, potongan sales, bobot sales)."),
-    ("EMPLOYEE_MASTER", "Data master karyawan: nama, departemen, tipe, jam masuk & pulang divisi, gaji bulanan."),
+    ("LEMBAR DOKUMENTASI & METADATA LAPORAN", ""),
+    ("Tujuan Laporan", "Rekapitulasi kehadiran karyawan, evaluasi kedisiplinan, analisis performa sales, dan payroll."),
+    ("Format & Standar", "Dihasilkan secara otomatis oleh sistem HR Dashboard terstandar."),
+    ("", ""),
+    ("STRUKTUR SHEET", ""),
+    ("DASHBOARD", "Ringkasan visual eksekutif: KPI utama, watchlist kedisiplinan, leaderboard sales, dan grafik."),
+    ("CONFIG", "Snapshot konfigurasi aturan absensi, toleransi telat, bobot KPI sales, dan tarif potongan payroll."),
+    ("EMPLOYEE_MASTER", "Master data karyawan aktif: ID, Nama, Divisi, Jabatan, Tipe (OFFICE/SALES), Gaji Pokok."),
     ("RAW_LOG", "Transaksi mentah dari mesin absensi setelah validasi dasar. Tidak diubah/dihapus (audit trail)."),
     ("DAILY_ATTENDANCE", "Hasil perhitungan harian per karyawan: scan pertama/terakhir, status, menit telat, lembur, anomali."),
     ("EMPLOYEE_SUMMARY", "KPI kehadiran per karyawan: attendance rate, punctuality, attendance score, tidak absen pulang, lembur."),
@@ -341,7 +355,7 @@ def generate_workbook(data: ReportData) -> bytes:
     _data_sheet(wb, "PAYROLL", data.payroll)
     _data_sheet(wb, "SALES_PERFORMANCE", data.sales_performance)
     _data_sheet(wb, "Sales_Activity", data.sales_activity)
-    if data.rejected is not None and not data.rejected.empty:
+    if data.rejected is not None and not data.rejected.is_empty():
         _data_sheet(wb, "Data_Ditolak", data.rejected)
     _build_readme(wb)
 

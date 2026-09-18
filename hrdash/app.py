@@ -9,12 +9,14 @@ Thin presentation layer only — all business logic lives in the other
 
 from __future__ import annotations
 
+import datetime as dt
 import io
 import logging
-from datetime import date, time
+from datetime import date, datetime, time
+from typing import Optional
 
-import pandas as pd
 import plotly.express as px
+import polars as pl
 import streamlit as st
 
 from .attendance import analytics as att_analytics
@@ -28,8 +30,14 @@ from .employee_master import (
     merge_master_into_log,
 )
 from .leave import build_leave_template, load_leave_workbook
-from .payroll import calculate_payroll
+from .payroll import calculate_payroll, build_payslip_records, PayslipData
 from .reporting.excel_report import ReportData, generate_workbook
+from .reporting.payslip import (
+    generate_payslip_pdf,
+    generate_bulk_payslip_pdf,
+    generate_payslip_excel,
+    generate_bulk_payslip_excel,
+)
 from .sales import (
     SalesActivityError,
     build_sales_activity_template,
@@ -54,26 +62,41 @@ except ImportError:
     REPORTLAB_AVAILABLE = False
 
 
+def _read_excel_fast(source: object, **kwargs) -> pl.DataFrame:
+    try:
+        return pl.read_excel(source, engine="calamine", **kwargs)
+    except Exception:
+        return pl.read_excel(source, **kwargs)
+
+
+@st.cache_data(show_spinner=False)
+def _read_excel_bytes(file_bytes: bytes, **kwargs) -> pl.DataFrame:
+    return _read_excel_fast(io.BytesIO(file_bytes), **kwargs)
+
+
+@st.cache_data(show_spinner=False)
+def _read_csv_bytes(file_bytes: bytes, **kwargs) -> pl.DataFrame:
+    return pl.read_csv(io.BytesIO(file_bytes), **kwargs)
+
+
 def _build_sample_attendance() -> bytes:
-    sample = pd.DataFrame(
-        {
-            "Department": ["Sales Mobil Baru", "Sales Mobil Baru", "HRD & Admin", "HRD & Admin"],
-            "No.": ["EMP001", "EMP001", "EMP002", "EMP002"],
-            "Name": ["Budi", "Budi", "Sari", "Sari"],
-            "Date/Time": [
-                "15/09/2026 07.54.23",
-                "15/09/2026 17.06.11",
-                "15/09/2026 08.22.02",
-                "15/09/2026 16.30.44",
-            ],
-        }
-    )
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Attendance"
+    ws.append(["Department", "Name", "No.", "Date/Time"])
+    ws.append(["OUR COMPANY", "1111", "1111", "21/08/2026 07.34.23"])
+    ws.append(["Sales Mobil Baru", "Budi Santoso", "EMP001", "21/08/2026 07.50.12"])
+    ws.append(["Sales Mobil Baru", "Budi Santoso", "EMP001", "21/08/2026 17.10.45"])
+    ws.append(["HRD & ADMIN", "Ani Lestari", "12021007", "21/08/2026 07.40.16"])
+    ws.append(["HRD & ADMIN", "Ani Lestari", "12021007", "21/08/2026 17.24.11"])
     b = io.BytesIO()
-    sample.to_excel(b, index=False)
+    wb.save(b)
     return b.getvalue()
 
 
-def _export_pdf(employee_summary: pd.DataFrame, department_summary: pd.DataFrame, insights: list[str]) -> bytes:
+def _export_pdf(employee_summary: pl.DataFrame, department_summary: pl.DataFrame, insights: list[str]) -> bytes:
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -94,12 +117,13 @@ def _export_pdf(employee_summary: pd.DataFrame, department_summary: pd.DataFrame
 
     story.append(Spacer(1, 5 * mm))
     story.append(Paragraph("Top Prioritas HR", styles["Heading2"]))
-    top = employee_summary.nsmallest(15, "Attendance_Score")
+    top = employee_summary.sort("Attendance_Score").head(15) if not employee_summary.is_empty() else pl.DataFrame()
     data = [["Karyawan", "Departemen", "Hadir", "Terlambat", "Mangkir", "Attendance Score"]]
-    for _, r in top.iterrows():
+    for r in top.iter_rows(named=True):
+        score_val = r.get("Attendance_Score", 0.0) or 0.0
         data.append(
-            [str(r["Name"]), str(r["Department"]), str(int(r["Hadir"])), str(int(r["Terlambat"])),
-             str(int(r["Mangkir"])), f"{r['Attendance_Score']:.1f}%"]
+            [str(r.get("Name", "")), str(r.get("Department", "")), str(int(r.get("Hadir", 0) or 0)),
+             str(int(r.get("Terlambat", 0) or 0)), str(int(r.get("Mangkir", 0) or 0)), f"{score_val:.1f}%"]
         )
     table = Table(data, repeatRows=1)
     table.setStyle(
@@ -115,14 +139,23 @@ def _export_pdf(employee_summary: pd.DataFrame, department_summary: pd.DataFrame
     )
     story.append(table)
 
-    if not department_summary.empty:
+    if not department_summary.is_empty():
         story.append(Spacer(1, 5 * mm))
         story.append(Paragraph("Ringkasan Departemen", styles["Heading2"]))
-        ddata = [["Departemen", "Employee", "Attendance", "Score", "Anomali"]]
-        for _, r in department_summary.iterrows():
+        ddata = [["Departemen", "Employee", "Working Days", "Total Man Days", "Attendance", "Score", "Anomali"]]
+        for r in department_summary.iter_rows(named=True):
+            att_rate = r.get("Attendance_Rate_%", 0.0) or 0.0
+            att_score = r.get("Attendance_Score_%", 0.0) or 0.0
             ddata.append(
-                [str(r["Department"]), str(int(r["Employee"])), f"{r['Attendance_Rate_%']:.1f}%",
-                 f"{r['Attendance_Score_%']:.1f}%", str(int(r["Anomalies"]))]
+                [
+                    str(r.get("Department", "")),
+                    str(int(r.get("Employee", 0) or 0)),
+                    str(int(r.get("Working_Days", 0) or 0)),
+                    str(int(r.get("Total_Man_Days", 0) or 0)),
+                    f"{att_rate:.1f}%",
+                    f"{att_score:.1f}%",
+                    str(int(r.get("Anomalies", 0) or 0)),
+                ]
             )
         dtable = Table(ddata, repeatRows=1)
         dtable.setStyle(
@@ -150,32 +183,147 @@ def _metric_grid(metrics: list[tuple[str, str, str]]) -> None:
                 st.metric(label=m[0], value=m[1], help=m[2] or None)
 
 
-def main() -> None:
-    st.set_page_config(
-        page_title="HR Attendance & Sales Dashboard",
-        page_icon="\U0001F4CA",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-    st.markdown(
-        """
-        <style>
-        .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
-        div[data-testid="stMetric"] {
-            background: var(--secondary-background-color);
-            color: var(--text-color);
-            border: 1px solid rgba(128, 128, 128, 0.28);
-            padding: 14px;
-            border-radius: 12px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
+# ---------------------------------------------------------------------------
+# Cached Data Pipeline
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data(show_spinner="Memproses kalkulasi absensi, payroll & performa sales...")
+def run_attendance_pipeline(
+    attendance_bytes: bytes,
+    master_bytes: Optional[bytes],
+    leave_bytes: Optional[bytes],
+    leave_is_csv: bool,
+    sales_bytes: Optional[bytes],
+    sales_is_csv: bool,
+    clock_in_str: str,
+    weekday_out_str: str,
+    saturday_out_str: str,
+    grace_minutes: int,
+    saturday_working: bool,
+    sunday_off: bool,
+    start_date_val: Optional[date],
+    end_date_val: Optional[date],
+    holidays_tuple: tuple[str, ...],
+    score_thresholds: tuple[float, float, float],
+    payroll_args: dict,
+    sales_weights: dict,
+    overtime_hourly_rate: float,
+) -> dict:
+    """Pure cached pipeline execution."""
+    raw = _read_excel_bytes(attendance_bytes)
+    clean, rejected, quality = clean_attendance_data(raw)
+    if clean.is_empty():
+        raise AttendanceValidationError("Tidak ada baris valid setelah proses cleaning.")
+
+    master = pl.DataFrame()
+    if master_bytes:
+        master = load_employee_master(_read_excel_bytes(master_bytes))
+
+    enriched, unmapped = merge_master_into_log(clean, master)
+
+    leave_result = None
+    approved_leave = None
+    if leave_bytes:
+        if leave_is_csv:
+            leave_raw = _read_csv_bytes(leave_bytes)
+            approved_leave = clean_approved_leave(leave_raw)
+        else:
+            leave_result = load_leave_workbook(io.BytesIO(leave_bytes))
+
+    holidays = set()
+    for line in holidays_tuple:
+        line = line.strip()
+        if line:
+            try:
+                holidays.add(datetime.strptime(line[:10], "%Y-%m-%d").date())
+            except ValueError:
+                pass
+
+    clock_in_t = time.fromisoformat(clock_in_str)
+    weekday_out_t = time.fromisoformat(weekday_out_str)
+    saturday_out_t = time.fromisoformat(saturday_out_str)
+
+    cfg = AppConfig(
+        attendance=AttendanceConfig(
+            clock_in=clock_in_t,
+            weekday_clock_out=weekday_out_t,
+            saturday_clock_out=saturday_out_t,
+            grace_minutes=grace_minutes,
+            saturday_is_working=saturday_working,
+            sunday_is_off=sunday_off,
+            start_date=start_date_val,
+            end_date=end_date_val,
+        ),
+        score=ScoreConfig(
+            excellent_threshold=score_thresholds[0],
+            good_threshold=score_thresholds[1],
+            watch_threshold=score_thresholds[2],
+        ),
+        payroll=PayrollConfig(**payroll_args),
+        sales_score=SalesScoreConfig(**sales_weights),
     )
 
-    st.title("\U0001F4CA HR Attendance, Payroll & Sales Performance Dashboard")
-    st.caption("Untuk HR, branch manager, dan supervisor dealer mobil")
+    daily = att_engine.build_daily_attendance(
+        enriched, cfg.attendance, holidays, approved_leave=approved_leave, leave_result=leave_result
+    )
+    employee_summary = att_analytics.calculate_employee_summary(daily, cfg.score)
+    department_summary = att_analytics.calculate_department_summary(daily)
+    trend = att_analytics.calculate_daily_trend(daily)
+    anomalies = daily.filter(pl.col("Is_Anomali") == 1) if not daily.is_empty() else pl.DataFrame()
+    insights = att_analytics.derive_hr_insights(employee_summary, department_summary)
+    payroll = calculate_payroll(employee_summary, master, cfg.payroll)
 
+    sales_activity = pl.DataFrame()
+    sales_performance = pl.DataFrame()
+    combined_view = pl.DataFrame()
+    if sales_bytes:
+        sales_raw = _read_csv_bytes(sales_bytes) if sales_is_csv else _read_excel_bytes(sales_bytes)
+        sales_activity = clean_sales_activity(sales_raw)
+        sales_performance = calculate_sales_performance(sales_activity, master, cfg.sales_score)
+        combined_view = combine_attendance_and_sales(employee_summary, sales_performance)
+
+    period_label = ""
+    if not daily.is_empty() and "Tanggal" in daily.columns:
+        period_label = f"{daily['Tanggal'].min()} s/d {daily['Tanggal'].max()}"
+
+    payslip_records = build_payslip_records(
+        payroll,
+        employee_summary,
+        daily,
+        master,
+        overtime_hourly_rate=overtime_hourly_rate,
+        period_label=period_label,
+    )
+
+    return {
+        "cfg": cfg,
+        "clean": clean,
+        "rejected": rejected,
+        "quality": quality,
+        "master": master,
+        "unmapped": unmapped,
+        "daily": daily,
+        "employee_summary": employee_summary,
+        "department_summary": department_summary,
+        "trend": trend,
+        "anomalies": anomalies,
+        "insights": insights,
+        "payroll": payroll,
+        "sales_activity": sales_activity,
+        "sales_performance": sales_performance,
+        "combined_view": combined_view,
+        "payslips": payslip_records,
+        "period_label": period_label,
+    }
+
+
+# ---------------------------------------------------------------------------
+# UI Components
+# ---------------------------------------------------------------------------
+
+
+def render_sidebar():
     with st.sidebar:
         st.header("1. Data")
         attendance_file = st.file_uploader("Export mesin absensi (wajib)", type=["xlsx", "xls"])
@@ -281,95 +429,55 @@ def main() -> None:
             w_delivery = st.slider("Bobot Delivery", 0.0, 1.0, 0.25)
             w_conv = st.slider("Bobot Conversion Rate", 0.0, 1.0, 0.15)
 
-    if attendance_file is None:
-        st.info("Upload export mesin absensi pada sidebar untuk memulai analisis.")
-        return
+        with st.expander("6. Identitas Slip Gaji & Upah Lembur"):
+            company_name = st.text_input("Nama Perusahaan / Dealer", value="PT. Dealership Maju Bersama")
+            company_address = st.text_input("Alamat Perusahaan", value="Surabaya, Indonesia")
+            overtime_hourly_rate = st.number_input("Tarif Lembur per Jam (Rp / jam)", min_value=0.0, value=0.0, step=5000.0)
 
-    cfg = AppConfig(
-        attendance=AttendanceConfig(
-            clock_in=clock_in,
-            weekday_clock_out=weekday_out,
-            saturday_clock_out=saturday_out,
-            grace_minutes=int(grace),
-            saturday_is_working=saturday_working,
-            sunday_is_off=sunday_off,
-            start_date=start_date_val,
-            end_date=end_date_val,
-        ),
-        score=ScoreConfig(excellent_threshold=excellent_t, good_threshold=good_t, watch_threshold=watch_t),
-        payroll=PayrollConfig(
-            late_deduction_mode="per_occurrence" if is_per_occ else "per_minute",
-            late_deduction_per_minute=late_rate_per_min if (use_late_rate and not is_per_occ) else None,
-            late_deduction_per_occurrence=late_rate_per_occ if (use_late_rate and is_per_occ) else None,
-            sales_no_clock_out_deduction=sales_no_out_rate if use_sales_no_out_rate else None,
-            early_leave_deduction_per_minute=early_rate if use_early_rate else None,
-            absence_deduction_per_day=absent_rate if use_absent_rate else None,
-        ),
-        sales_score=SalesScoreConfig(
-            weight_visit=w_visit, weight_test_drive=w_td, weight_spk=w_spk,
-            weight_delivery=w_delivery, weight_conversion_rate=w_conv,
-        ),
+    payroll_args = {
+        "late_deduction_mode": "per_occurrence" if is_per_occ else "per_minute",
+        "late_deduction_per_minute": late_rate_per_min if (use_late_rate and not is_per_occ) else None,
+        "late_deduction_per_occurrence": late_rate_per_occ if (use_late_rate and is_per_occ) else None,
+        "sales_no_clock_out_deduction": sales_no_out_rate if use_sales_no_out_rate else None,
+        "early_leave_deduction_per_minute": early_rate if use_early_rate else None,
+        "absence_deduction_per_day": absent_rate if use_absent_rate else None,
+    }
+    sales_weights = {
+        "weight_visit": w_visit,
+        "weight_test_drive": w_td,
+        "weight_spk": w_spk,
+        "weight_delivery": w_delivery,
+        "weight_conversion_rate": w_conv,
+    }
+    company_info = {
+        "name": company_name,
+        "address": company_address,
+    }
+    holidays_tuple = tuple(line.strip() for line in holidays_text.splitlines() if line.strip())
+
+    return (
+        attendance_file,
+        master_file,
+        leave_file,
+        sales_file,
+        clock_in.isoformat(),
+        weekday_out.isoformat(),
+        saturday_out.isoformat(),
+        int(grace),
+        saturday_working,
+        sunday_off,
+        start_date_val,
+        end_date_val,
+        holidays_tuple,
+        (excellent_t, good_t, watch_t),
+        payroll_args,
+        sales_weights,
+        company_info,
+        overtime_hourly_rate,
     )
 
-    try:
-        raw = pd.read_excel(attendance_file)
-        clean, rejected, quality = clean_attendance_data(raw)
-        if clean.empty:
-            raise AttendanceValidationError("Tidak ada baris valid setelah proses cleaning.")
 
-        master = pd.DataFrame()
-        if master_file is not None:
-            master = load_employee_master(pd.read_excel(master_file))
-
-        enriched, unmapped = merge_master_into_log(clean, master)
-
-        leave_result = None
-        approved_leave = None
-        if leave_file is not None:
-            if leave_file.name.lower().endswith(".csv"):
-                leave_raw = pd.read_csv(leave_file)
-                approved_leave = clean_approved_leave(leave_raw)
-            else:
-                leave_result = load_leave_workbook(leave_file)
-
-        holidays = set()
-        for line in holidays_text.splitlines():
-            line = line.strip()
-            if line:
-                holidays.add(pd.Timestamp(line).date())
-
-        daily = att_engine.build_daily_attendance(
-            enriched, cfg.attendance, holidays, approved_leave=approved_leave, leave_result=leave_result
-        )
-        employee_summary = att_analytics.calculate_employee_summary(daily, cfg.score)
-        department_summary = att_analytics.calculate_department_summary(daily)
-        trend = att_analytics.calculate_daily_trend(daily)
-        anomalies = daily[daily["Is_Anomali"] == 1].copy()
-        insights = att_analytics.derive_hr_insights(employee_summary, department_summary)
-        payroll = calculate_payroll(employee_summary, master, cfg.payroll)
-
-        sales_activity = pd.DataFrame()
-        sales_performance = pd.DataFrame()
-        combined_view = pd.DataFrame()
-        if sales_file is not None:
-            sales_raw = (
-                pd.read_csv(sales_file) if sales_file.name.lower().endswith(".csv") else pd.read_excel(sales_file)
-            )
-            sales_activity = clean_sales_activity(sales_raw)
-            sales_performance = calculate_sales_performance(sales_activity, master, cfg.sales_score)
-            combined_view = combine_attendance_and_sales(employee_summary, sales_performance)
-
-    except (AttendanceValidationError, EmployeeMasterError, SalesActivityError) as exc:
-        st.error(f"Data tidak dapat diproses: {exc}")
-        return
-    except Exception as exc:
-        LOGGER.exception("Processing failed")
-        st.error(f"Data tidak dapat diproses: {exc}")
-        return
-
-    # ------------------------------------------------------------------
-    # Data quality
-    # ------------------------------------------------------------------
+def render_overview_section(quality: dict, unmapped: pl.DataFrame, daily: pl.DataFrame, employee_summary: pl.DataFrame, insights: list[str]):
     _metric_grid(
         [
             ("Baris sumber", f"{quality['input_rows']:,}", "Jumlah baris dari file mesin."),
@@ -379,25 +487,25 @@ def main() -> None:
             ("Karyawan", f"{quality['employees']:,}", "Jumlah Employee ID unik."),
         ]
     )
-    if len(unmapped):
+    if not unmapped.is_empty():
         st.warning(
             f"{len(unmapped)} Employee ID pada log absensi tidak ditemukan di Employee Master "
             "(memakai fallback nama/departemen dari mesin absensi)."
         )
 
     st.subheader("Executive Summary")
-    working = int(daily["Is_Working_Day"].sum())
-    present = int(daily["Present_Flag"].sum())
-    attendance_rate = (present / working * 100) if working else 100
-    avg_score = float(employee_summary["Attendance_Score"].mean()) if not employee_summary.empty else 0
+    working = int(daily["Is_Working_Day"].sum()) if not daily.is_empty() and "Is_Working_Day" in daily.columns else 0
+    present = int(daily["Present_Flag"].sum()) if not daily.is_empty() and "Present_Flag" in daily.columns else 0
+    attendance_rate = (present / working * 100.0) if working else 100.0
+    avg_score = float(employee_summary["Attendance_Score"].mean()) if not employee_summary.is_empty() and "Attendance_Score" in employee_summary.columns else 0.0
     _metric_grid(
         [
             ("Attendance Rate", f"{attendance_rate:.1f}%", "Persentase kehadiran pada hari kerja."),
             ("Attendance Score", f"{avg_score:.1f}%", "Rata-rata skor kehadiran karyawan."),
-            ("Terlambat", f"{int(daily['Late_Flag'].sum()):,}", "Total kejadian terlambat."),
-            ("Total Menit Telat", f"{int(daily['Menit_Telat'].sum()):,}", "Akumulasi menit keterlambatan."),
-            ("Mangkir", f"{int(daily['Absent_Flag'].sum()):,}", "Hari kerja tanpa log dan tanpa cuti/izin."),
-            ("Anomali", f"{int(daily['Is_Anomali'].sum()):,}", "Hari dengan anomali yang perlu ditinjau HR."),
+            ("Terlambat", f"{int(daily['Late_Flag'].sum()):,}" if not daily.is_empty() else "0", "Total kejadian terlambat."),
+            ("Total Menit Telat", f"{int(daily['Menit_Telat'].sum()):,}" if not daily.is_empty() else "0", "Akumulasi menit keterlambatan."),
+            ("Mangkir", f"{int(daily['Absent_Flag'].sum()):,}" if not daily.is_empty() else "0", "Hari kerja tanpa log dan tanpa cuti/izin."),
+            ("Anomali", f"{int(daily['Is_Anomali'].sum()):,}" if not daily.is_empty() else "0", "Hari dengan anomali yang perlu ditinjau HR."),
         ]
     )
 
@@ -405,13 +513,113 @@ def main() -> None:
     for insight in insights:
         st.info(insight)
 
+
+def _render_payslip_card(slip: PayslipData, company_info: dict):
+    """Render interactive document preview of the payslip exactly matching the generated template."""
+    c_name = company_info.get("name", "PT. Dealership Maju Bersama")
+    c_addr = company_info.get("address", "Surabaya, Indonesia")
+
+    card_html = f"""
+    <div style="background-color: #ffffff; color: #1a1a1a; padding: 28px; border-radius: 8px; border: 1px solid #d0d7de; font-family: 'Segoe UI', Inter, -apple-system, sans-serif; max-width: 820px; margin: 0 auto; box-shadow: 0 4px 16px rgba(0,0,0,0.07);">
+        <!-- Header -->
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 2.5px solid #1F4E78; padding-bottom: 12px; margin-bottom: 16px;">
+            <div>
+                <div style="font-size: 16px; font-weight: bold; color: #1F4E78; margin-bottom: 2px;">{c_name}</div>
+                <div style="font-size: 12px; color: #595959;">{c_addr}</div>
+            </div>
+            <div style="font-size: 26px; font-weight: bold; color: #1a1a1a; letter-spacing: 0.5px;">Slip Gaji</div>
+        </div>
+
+        <!-- Meta -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 13px; margin-bottom: 16px; background-color: #f8fafc; padding: 12px 16px; border-radius: 6px; border: 1px solid #e2e8f0; line-height: 1.6;">
+            <div><b>Nama / NIK:</b> {slip.name} ({slip.employee_id})</div>
+            <div><b>Tgl Mulai Bekerja:</b> {slip.join_date or '-'}</div>
+            <div><b>Dept / Jabatan:</b> {slip.department} / {slip.position}</div>
+            <div><b>Periode Gaji:</b> {slip.period_label or '-'}</div>
+        </div>
+
+        <!-- Two column financial table -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px;">
+            <!-- Earnings -->
+            <div>
+                <div style="background-color: #D9D9D9; color: #1a1a1a; padding: 7px 12px; font-weight: bold; font-size: 13px; border-radius: 4px 4px 0 0;">Pendapatan</div>
+                <div style="border: 1px solid #e2e8f0; border-top: none; padding: 12px; font-size: 12.5px; line-height: 1.9; background-color: #ffffff;">
+                    <div style="display: flex; justify-content: space-between;"><span>Gaji Pokok</span> <span>Rp {slip.gaji_pokok:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Lembur ({slip.lembur_hours:.1f} Jam)</span> <span>Rp {slip.lembur_pay:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Tunjangan Jabatan</span> <span>Rp {slip.tunjangan_jabatan:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Uang Makan</span> <span>Rp {slip.uang_makan:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Tunjangan Parkir / Transport</span> <span>Rp {slip.tunjangan_transport:,.0f}</span></div>
+                    <div style="border-top: 2px solid #1a1a1a; margin-top: 10px; padding-top: 8px; display: flex; justify-content: space-between; font-weight: bold; font-size: 13px;">
+                        <span>Total Pendapatan</span> <span>Rp {slip.total_pendapatan:,.0f}</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Deductions -->
+            <div>
+                <div style="background-color: #D9D9D9; color: #1a1a1a; padding: 7px 12px; font-weight: bold; font-size: 13px; border-radius: 4px 4px 0 0;">Potongan</div>
+                <div style="border: 1px solid #e2e8f0; border-top: none; padding: 12px; font-size: 12.5px; line-height: 1.9; background-color: #ffffff;">
+                    <div style="display: flex; justify-content: space-between;"><span>Potongan Absen (Mangkir)</span> <span>Rp {slip.potongan_mangkir:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Potongan Datang Terlambat</span> <span>Rp {slip.potongan_telat:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Potongan Pulang Cepat</span> <span>Rp {slip.potongan_pulang_cepat:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Potongan Lupa Absen Pulang (Sales)</span> <span>Rp {slip.potongan_lupa_pulang_sales:,.0f}</span></div>
+                    <div style="display: flex; justify-content: space-between;"><span>Potongan Lain-lain</span> <span>Rp {slip.potongan_lain:,.0f}</span></div>
+                    <div style="border-top: 2px solid #1a1a1a; margin-top: 10px; padding-top: 8px; display: flex; justify-content: space-between; font-weight: bold; font-size: 13px;">
+                        <span>Total Potongan</span> <span>Rp {slip.total_potongan:,.0f}</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Take Home Pay Box -->
+        <div style="background-color: #EBF1F5; border: 1.5px solid #1F4E78; border-radius: 6px; padding: 12px 18px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <span style="font-size: 14px; font-weight: bold; color: #1F4E78;">Gaji Bersih / Take Home Pay</span>
+            <span style="font-size: 20px; font-weight: bold; color: #1F4E78;">Rp {slip.take_home_pay:,.0f}</span>
+        </div>
+
+        <!-- Attendance Summary -->
+        <div style="margin-bottom: 20px;">
+            <div style="background-color: #D9D9D9; color: #1a1a1a; padding: 7px 12px; font-weight: bold; font-size: 13px; border-radius: 4px 4px 0 0;">Rangkuman Informasi Kehadiran</div>
+            <div style="border: 1px solid #e2e8f0; border-top: none; padding: 12px 16px; font-size: 12.5px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; background-color: #ffffff; line-height: 1.8;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Kehadiran:</span> <b>{slip.hari_kehadiran} Hari</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Ketidak Hadiran (Mangkir):</span> <b>{slip.hari_mangkir} Hari</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Cuti:</span> <b>{slip.hari_cuti} Hari</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Izin:</span> <b>{slip.hari_izin} Hari</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Sakit:</span> <b>{slip.hari_sakit} Hari</b></div>
+                </div>
+                <div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Terlambat:</span> <b>{slip.kali_terlambat} Kali ({slip.menit_terlambat} Menit)</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Pulang Lebih Dulu:</span> <b>{slip.kali_pulang_cepat} Kali</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Lupa Absen:</span> <b>{slip.kali_lupa_absen} Kali</b></div>
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 2px;"><span>Total Jam Lembur:</span> <b>{slip.total_jam_lembur:.1f} Jam</b></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    """
+    st.iframe(card_html, height=800)
+
+
+def render_tabs(res: dict, company_info: dict, has_sales_file: bool):
+    trend = res["trend"]
+    department_summary = res["department_summary"]
+    employee_summary = res["employee_summary"]
+    daily = res["daily"]
+    anomalies = res["anomalies"]
+    payroll = res["payroll"]
+    sales_performance = res["sales_performance"]
+    combined_view = res["combined_view"]
+    payslips = res.get("payslips", [])
+    cfg = res["cfg"]
+
     tabs = st.tabs(
         ["\U0001F4C8 Trends", "\U0001F3E2 Department", "\U0001F464 Employee", "\U0001F6A8 Anomaly",
-         "\U0001F4B0 Payroll", "\U0001F697 Sales Performance"]
+         "\U0001F4B0 Payroll & Slip Gaji", "\U0001F697 Sales Performance"]
     )
 
     with tabs[0]:
-        if not trend.empty:
+        if not trend.is_empty():
             fig = px.line(trend, x="Tanggal", y="Attendance_Rate_%", markers=True, title="Trend Attendance Rate")
             fig.update_yaxes(range=[0, 100], ticksuffix="%")
             st.plotly_chart(fig, width="stretch")
@@ -422,69 +630,67 @@ def main() -> None:
                 st.plotly_chart(px.bar(trend, x="Tanggal", y="Absent", title="Mangkir Harian"), width="stretch")
 
     with tabs[1]:
-        if not department_summary.empty:
+        if not department_summary.is_empty():
             fig = px.bar(
-                department_summary.sort_values("Attendance_Score_%"), x="Department", y="Attendance_Score_%",
+                department_summary.sort("Attendance_Score_%"), x="Department", y="Attendance_Score_%",
                 text="Attendance_Score_%", title="Attendance Score per Department",
             )
             fig.update_yaxes(range=[0, 100], ticksuffix="%")
             fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
             st.plotly_chart(fig, width="stretch")
-            st.dataframe(
-                department_summary.style.format({"Attendance_Rate_%": "{:.1f}%", "Attendance_Score_%": "{:.1f}%"}),
-                width="stretch", hide_index=True,
-            )
+            st.dataframe(department_summary, width="stretch", hide_index=True)
 
     with tabs[2]:
         c1, c2 = st.columns([1, 2])
         with c1:
-            depts = ["Semua"] + sorted(employee_summary["Department"].dropna().unique().tolist())
+            depts = ["Semua"] + sorted([d for d in employee_summary["Department"].drop_nulls().unique().to_list()]) if not employee_summary.is_empty() else ["Semua"]
             selected_dept = st.selectbox("Filter departemen", depts)
         with c2:
             search = st.text_input("Cari nama / employee ID")
 
-        view = employee_summary.copy()
-        if selected_dept != "Semua":
-            view = view[view["Department"] == selected_dept]
-        if search:
-            mask = view["Name"].str.contains(search, case=False, na=False) | view["No."].astype(str).str.contains(
-                search, case=False, na=False
+        view = employee_summary
+        if selected_dept != "Semua" and not view.is_empty():
+            view = view.filter(pl.col("Department") == selected_dept)
+        if search and not view.is_empty():
+            s_low = search.lower()
+            view = view.filter(
+                pl.col("Name").cast(pl.String).str.to_lowercase().str.contains(s_low)
+                | pl.col("No.").cast(pl.String).str.to_lowercase().str.contains(s_low)
             )
-            view = view[mask]
-        st.dataframe(
-            view.style.format({"Attendance_Rate_%": "{:.1f}%", "Punctuality_Rate_%": "{:.1f}%", "Attendance_Score": "{:.1f}%"}),
-            width="stretch", hide_index=True,
-        )
+        st.dataframe(view, width="stretch", hide_index=True)
 
-        if not view.empty:
+        if not view.is_empty():
+            no_list = view["No."].to_list()
+            name_map = dict(zip(view["No."].to_list(), view["Name"].to_list()))
             selected_emp = st.selectbox(
-                "Buka histori karyawan", view["No."].tolist(),
-                format_func=lambda x: f"{x} \u2014 {view.loc[view['No.'].eq(x), 'Name'].iloc[0]}",
+                "Buka histori karyawan", no_list,
+                format_func=lambda x: f"{x} \u2014 {name_map.get(x, '')}",
             )
-            person = daily[daily["No."] == selected_emp]
+            person = daily.filter(pl.col("No.") == selected_emp) if not daily.is_empty() else pl.DataFrame()
             hist_cols = [
                 "Tanggal", "Hari", "Jam_Masuk", "Jam_Pulang", "Status_Masuk", "Menit_Telat",
                 "Status_Pulang", "Menit_Pulang_Cepat", "Overtime_Hours", "Group_Event",
                 "Scan_Count", "Anomaly_Type", "Severity",
             ]
             person_cols = [c for c in hist_cols if c in person.columns]
-            st.dataframe(person[person_cols], width="stretch", hide_index=True)
+            st.dataframe(person.select(person_cols) if not person.is_empty() else pl.DataFrame(), width="stretch", hide_index=True)
 
     with tabs[3]:
         sev_order = ["HIGH", "LOW"]
-        view = anomalies.copy()
-        if not view.empty:
+        view = anomalies
+        if not view.is_empty():
             sev_filter = st.multiselect("Severity", sev_order, default=sev_order)
             if sev_filter:
-                view = view[view["Severity"].isin(sev_filter)]
+                view = view.filter(pl.col("Severity").is_in(sev_filter))
         anom_cols = [
             "No.", "Name", "Department", "Tanggal", "Hari", "Jam_Masuk", "Jam_Pulang",
             "Status_Masuk", "Status_Pulang", "Group_Event", "Anomaly_Type", "Severity",
         ]
         view_cols = [c for c in anom_cols if c in view.columns]
-        st.dataframe(view[view_cols], width="stretch", hide_index=True)
+        st.dataframe(view.select(view_cols) if not view.is_empty() else pl.DataFrame(), width="stretch", hide_index=True)
 
     with tabs[4]:
+        st.subheader("Rekap Payroll Karyawan")
         if not cfg.payroll.is_configured:
             st.warning("Tarif potongan belum diatur pada sidebar \u2014 kolom potongan akan kosong.")
         else:
@@ -499,35 +705,105 @@ def main() -> None:
                 st.caption(" • ".join(notes))
         st.dataframe(payroll, width="stretch", hide_index=True)
 
-    with tabs[5]:
-        if sales_file is None:
-            st.info("Upload data Sales Activity pada sidebar untuk melihat performa sales.")
-        elif sales_performance.empty:
-            st.warning("Tidak ada baris valid pada file Sales Activity.")
+        st.markdown("---")
+        st.subheader("\U0001F4C4 Cetak & Ekspor Slip Gaji")
+
+        if not payslips:
+            st.info("Data slip gaji belum tersedia.")
         else:
-            st.dataframe(
-                sales_performance.style.format(
-                    {"Conversion_Rate_%": "{:.1f}%", "Performance_Score": "{:.1f}"}
-                ),
-                width="stretch", hide_index=True,
-            )
-            if not combined_view.empty:
-                st.markdown("**Attendance vs Sales Performance**")
-                st.dataframe(
-                    combined_view.style.format(
-                        {"Attendance_Rate_%": "{:.1f}%", "Attendance_Score": "{:.1f}%", "Performance_Score": "{:.1f}"}
-                    ),
-                    width="stretch", hide_index=True,
+            # 1. Bulk Export Section
+            st.markdown("##### \U0001F4E6 Ekspor Massal (Bulk Export)")
+            b1, b2 = st.columns(2)
+            with b1:
+                bulk_pdf = generate_bulk_payslip_pdf(payslips, company_info)
+                st.download_button(
+                    "\U0001F4E6 Download Semua Slip Gaji (Bulk PDF)",
+                    data=bulk_pdf,
+                    file_name="Bulk_Slip_Gaji_Karyawan.pdf",
+                    mime="application/pdf",
+                    width="stretch",
+                    help="Mengunduh seluruh slip gaji karyawan dalam 1 file PDF multi-halaman.",
+                )
+            with b2:
+                bulk_excel = generate_bulk_payslip_excel(payslips, company_info)
+                st.download_button(
+                    "\U0001F4CA Download Semua Slip Gaji (Bulk Excel)",
+                    data=bulk_excel,
+                    file_name="Bulk_Slip_Gaji_Karyawan.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                    help="Mengunduh seluruh slip gaji karyawan dalam 1 workbook Excel (1 sheet per karyawan).",
                 )
 
-    # ------------------------------------------------------------------
-    # Exports
-    # ------------------------------------------------------------------
+            st.markdown("---")
+            st.markdown("##### \U0001F464 Pratinjau & Cetak Slip Gaji Per Karyawan")
+
+            # Selection
+            slip_map = {s.employee_id: s for s in payslips}
+            selected_slip_id = st.selectbox(
+                "Pilih Karyawan",
+                list(slip_map.keys()),
+                format_func=lambda x: f"{x} \u2014 {slip_map[x].name} ({slip_map[x].department})",
+                key="payslip_emp_selector",
+            )
+
+            current_slip = slip_map[selected_slip_id]
+
+            # Action Buttons for single employee
+            s1, s2 = st.columns(2)
+            with s1:
+                single_pdf = generate_payslip_pdf(current_slip, company_info)
+                st.download_button(
+                    f"\U0001F4C4 Download Slip {current_slip.name} (PDF)",
+                    data=single_pdf,
+                    file_name=f"Slip_Gaji_{current_slip.employee_id}_{current_slip.name.replace(' ', '_')}.pdf",
+                    mime="application/pdf",
+                    width="stretch",
+                )
+            with s2:
+                single_excel = generate_payslip_excel(current_slip, company_info)
+                st.download_button(
+                    f"\U0001F4CA Download Slip {current_slip.name} (Excel)",
+                    data=single_excel,
+                    file_name=f"Slip_Gaji_{current_slip.employee_id}_{current_slip.name.replace(' ', '_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                )
+
+            st.write("")
+            _render_payslip_card(current_slip, company_info)
+
+    with tabs[5]:
+        if not has_sales_file:
+            st.info("Upload data Sales Activity pada sidebar untuk melihat performa sales.")
+        elif sales_performance.is_empty():
+            st.warning("Tidak ada baris valid pada file Sales Activity.")
+        else:
+            st.dataframe(sales_performance, width="stretch", hide_index=True)
+            if not combined_view.is_empty():
+                st.markdown("**Attendance vs Sales Performance**")
+                st.dataframe(combined_view, width="stretch", hide_index=True)
+
+
+def render_exports_section(res: dict):
     st.subheader("Export & Sharing")
+    cfg = res["cfg"]
+    daily = res["daily"]
+    master = res["master"]
+    clean = res["clean"]
+    employee_summary = res["employee_summary"]
+    department_summary = res["department_summary"]
+    trend = res["trend"]
+    anomalies = res["anomalies"]
+    rejected = res["rejected"]
+    payroll = res["payroll"]
+    sales_activity = res["sales_activity"]
+    sales_performance = res["sales_performance"]
+    insights = res["insights"]
+    unmapped = res["unmapped"]
+
     try:
-        period_label = ""
-        if not daily.empty:
-            period_label = f"{daily['Tanggal'].min()} s/d {daily['Tanggal'].max()}"
+        period_label = res.get("period_label", "")
 
         report = ReportData(
             config=cfg,
@@ -568,13 +844,111 @@ def main() -> None:
         LOGGER.exception("Export failed")
         st.error(f"Export gagal: {exc}")
 
-    if not rejected.empty:
+    if not rejected.is_empty():
         with st.expander(f"Data ditolak saat cleaning ({len(rejected):,} baris)"):
             st.dataframe(rejected, width="stretch", hide_index=True)
 
-    if len(unmapped):
+    if not unmapped.is_empty():
         with st.expander(f"Employee ID belum ada di Employee Master ({len(unmapped):,})"):
             st.dataframe(unmapped, width="stretch", hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Main Application
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="HR Attendance & Sales Dashboard",
+        page_icon="\U0001F4CA",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.markdown(
+        """
+        <style>
+        .block-container { padding-top: 1.4rem; padding-bottom: 2rem; }
+        div[data-testid="stMetric"] {
+            background: var(--secondary-background-color);
+            color: var(--text-color);
+            border: 1px solid rgba(128, 128, 128, 0.28);
+            padding: 14px;
+            border-radius: 12px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.title("\U0001F4CA HR Attendance, Payroll & Sales Performance Dashboard")
+    st.caption("Untuk HR, branch manager, dan supervisor dealer mobil")
+
+    (
+        attendance_file,
+        master_file,
+        leave_file,
+        sales_file,
+        clock_in_str,
+        weekday_out_str,
+        saturday_out_str,
+        grace_minutes,
+        saturday_working,
+        sunday_off,
+        start_date_val,
+        end_date_val,
+        holidays_tuple,
+        score_thresholds,
+        payroll_args,
+        sales_weights,
+        company_info,
+        overtime_hourly_rate,
+    ) = render_sidebar()
+
+    if attendance_file is None:
+        st.info("Upload export mesin absensi pada sidebar untuk memulai analisis.")
+        return
+
+    attendance_bytes = attendance_file.getvalue()
+    master_bytes = master_file.getvalue() if master_file else None
+    leave_bytes = leave_file.getvalue() if leave_file else None
+    leave_is_csv = leave_file.name.lower().endswith(".csv") if leave_file else False
+    sales_bytes = sales_file.getvalue() if sales_file else None
+    sales_is_csv = sales_file.name.lower().endswith(".csv") if sales_file else False
+
+    try:
+        res = run_attendance_pipeline(
+            attendance_bytes,
+            master_bytes,
+            leave_bytes,
+            leave_is_csv,
+            sales_bytes,
+            sales_is_csv,
+            clock_in_str,
+            weekday_out_str,
+            saturday_out_str,
+            grace_minutes,
+            saturday_working,
+            sunday_off,
+            start_date_val,
+            end_date_val,
+            holidays_tuple,
+            score_thresholds,
+            payroll_args,
+            sales_weights,
+            overtime_hourly_rate,
+        )
+    except (AttendanceValidationError, EmployeeMasterError, SalesActivityError) as exc:
+        st.error(f"Data tidak dapat diproses: {exc}")
+        return
+    except Exception as exc:
+        LOGGER.exception("Processing failed")
+        st.error(f"Data tidak dapat diproses: {exc}")
+        return
+
+    render_overview_section(res["quality"], res["unmapped"], res["daily"], res["employee_summary"], res["insights"])
+    render_tabs(res, company_info, has_sales_file=sales_file is not None)
+    render_exports_section(res)
 
 
 if __name__ == "__main__":

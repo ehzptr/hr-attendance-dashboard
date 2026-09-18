@@ -10,13 +10,14 @@ on the attendance machine (Section 3) and this module never pretends it is.
 from __future__ import annotations
 
 import io
+from typing import Optional
 
-import numpy as np
-import pandas as pd
+import polars as pl
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 from .config import SalesScoreConfig
+from .attendance.parser import parse_datetime_expr
 
 SALES_ACTIVITY_COLUMNS = ["No.", "Tanggal", "Prospect", "Visit", "Test_Drive", "SPK", "Delivery", "Revenue"]
 
@@ -34,18 +35,34 @@ class SalesActivityError(ValueError):
     pass
 
 
-def clean_sales_activity(raw_df: pd.DataFrame | None) -> pd.DataFrame:
+def _clean_col(name: object) -> str:
+    return str(name).replace("\n", " ").strip()
+
+
+def clean_sales_activity(raw_input: Optional[pl.DataFrame]) -> pl.DataFrame:
     """Validate and normalize an uploaded Sales Activity file.
 
     Required columns: employee ID and date. All KPI columns are optional
     and default to 0 when absent, since a sales rep may have zero of a
     given activity on a given day — that is data, not a missing value.
     """
-    if raw_df is None or raw_df.empty:
-        return pd.DataFrame(columns=SALES_ACTIVITY_COLUMNS)
+    if raw_input is None or raw_input.is_empty():
+        return pl.DataFrame(
+            schema={
+                "No.": pl.String,
+                "Tanggal": pl.Date,
+                "Prospect": pl.Float64,
+                "Visit": pl.Float64,
+                "Test_Drive": pl.Float64,
+                "SPK": pl.Float64,
+                "Delivery": pl.Float64,
+                "Revenue": pl.Float64,
+            }
+        )
 
-    df = raw_df.copy()
-    df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
+    df = raw_input
+    rename_map = {c: _clean_col(c) for c in df.columns}
+    df = df.rename(rename_map)
 
     id_col = next((c for c in ["No.", "Employee ID", "ID", "NIK"] if c in df.columns), None)
     date_col = next((c for c in ["Tanggal", "Date"] if c in df.columns), None)
@@ -55,10 +72,6 @@ def clean_sales_activity(raw_df: pd.DataFrame | None) -> pd.DataFrame:
             "dan tanggal (Tanggal/Date)."
         )
 
-    out = pd.DataFrame()
-    out["No."] = df[id_col].astype("string").str.strip()
-    out["Tanggal"] = pd.to_datetime(df[date_col], format="mixed", dayfirst=True, errors="coerce").dt.date
-
     kpi_map = {
         "Prospect": ["Prospect", "Prospek"],
         "Visit": ["Visit", "Customer Visit"],
@@ -67,26 +80,41 @@ def clean_sales_activity(raw_df: pd.DataFrame | None) -> pd.DataFrame:
         "Delivery": ["Delivery"],
         "Revenue": ["Revenue"],
     }
+
+    select_exprs = [
+        pl.col(id_col).cast(pl.String).str.strip_chars().alias("No."),
+        parse_datetime_expr(date_col).dt.date().alias("Tanggal"),
+    ]
+
     for target, candidates in kpi_map.items():
-        col = next((c for c in candidates if c in df.columns), None)
-        out[target] = pd.to_numeric(df[col], errors="coerce").fillna(0) if col else 0.0
+        matched = next((c for c in candidates if c in df.columns), None)
+        if matched:
+            select_exprs.append(pl.col(matched).cast(pl.Float64, strict=False).fill_null(0.0).alias(target))
+        else:
+            select_exprs.append(pl.lit(0.0, dtype=pl.Float64).alias(target))
 
-    out = out.dropna(subset=["No.", "Tanggal"])
-    return out[SALES_ACTIVITY_COLUMNS].reset_index(drop=True)
+    out = df.select(select_exprs)
+    out = out.filter(pl.col("No.").is_not_null() & (pl.col("No.") != "") & pl.col("Tanggal").is_not_null())
+    return out.select(SALES_ACTIVITY_COLUMNS)
 
 
-def _normalize_0_100(series: pd.Series) -> pd.Series:
-    lo, hi = series.min(), series.max()
-    if pd.isna(lo) or pd.isna(hi) or hi == lo:
-        return pd.Series(np.where(series > 0, 100.0, 0.0), index=series.index)
-    return (series - lo) / (hi - lo) * 100.0
+def _normalize_series(s: pl.Series) -> list[float]:
+    vals = s.to_list()
+    valid_vals = [v for v in vals if v is not None]
+    if not valid_vals:
+        return [0.0] * len(vals)
+    lo = min(valid_vals)
+    hi = max(valid_vals)
+    if hi == lo:
+        return [100.0 if (v is not None and v > 0) else 0.0 for v in vals]
+    return [round((v - lo) / (hi - lo) * 100.0, 4) if v is not None else 0.0 for v in vals]
 
 
 def calculate_sales_performance(
-    sales_activity: pd.DataFrame,
-    master: pd.DataFrame,
+    sales_activity: Optional[pl.DataFrame],
+    master: Optional[pl.DataFrame],
     cfg: SalesScoreConfig,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     """Aggregate Sales Activity into per-employee sales KPIs (Section 4).
 
     Performance_Score blends KPI volume (Visit/Test Drive/SPK/Delivery) and
@@ -95,28 +123,57 @@ def calculate_sales_performance(
     for the selected period, since no fixed company-wide sales target was
     supplied.
     """
-    if sales_activity.empty:
-        return pd.DataFrame(columns=SALES_PERFORMANCE_COLUMNS)
+    if sales_activity is None or sales_activity.is_empty():
+        return pl.DataFrame(
+            schema={
+                "No.": pl.String,
+                "Name": pl.String,
+                "Department": pl.String,
+                "Prospect": pl.Float64,
+                "Visit": pl.Float64,
+                "Test_Drive": pl.Float64,
+                "SPK": pl.Float64,
+                "Delivery": pl.Float64,
+                "Revenue": pl.Float64,
+                "Conversion_Rate_%": pl.Float64,
+                "Performance_Score": pl.Float64,
+                "Performance_Classification": pl.String,
+            }
+        )
 
-    agg = sales_activity.groupby("No.", as_index=False).agg(
-        Prospect=("Prospect", "sum"),
-        Visit=("Visit", "sum"),
-        Test_Drive=("Test_Drive", "sum"),
-        SPK=("SPK", "sum"),
-        Delivery=("Delivery", "sum"),
-        Revenue=("Revenue", "sum"),
-    )
-    agg["Conversion_Rate_%"] = np.where(
-        agg["Prospect"] > 0, agg["SPK"] / agg["Prospect"] * 100, 0.0
+    agg = sales_activity.group_by("No.", maintain_order=True).agg(
+        Prospect=pl.col("Prospect").cast(pl.Float64).sum(),
+        Visit=pl.col("Visit").cast(pl.Float64).sum(),
+        Test_Drive=pl.col("Test_Drive").cast(pl.Float64).sum(),
+        SPK=pl.col("SPK").cast(pl.Float64).sum(),
+        Delivery=pl.col("Delivery").cast(pl.Float64).sum(),
+        Revenue=pl.col("Revenue").cast(pl.Float64).sum(),
     )
 
-    if master is not None and not master.empty:
-        m = master.set_index("No.")
-        agg["Name"] = agg["No."].map(m["Name"]).fillna(agg["No."].map(lambda x: f"Sales {x}"))
-        agg["Department"] = agg["No."].map(m["Department"]).fillna("Belum Dipetakan")
+    agg = agg.with_columns(
+        **{
+            "Conversion_Rate_%": pl.when(pl.col("Prospect") > 0)
+            .then(pl.col("SPK") / pl.col("Prospect") * 100.0)
+            .otherwise(0.0)
+        }
+    )
+
+    if master is not None and not master.is_empty() and "No." in master.columns:
+        m_sub = master.select(
+            [c for c in ["No.", "Name", "Department"] if c in master.columns]
+        ).unique(subset=["No."])
+        agg = agg.join(m_sub, on="No.", how="left")
+        agg = agg.with_columns(
+            Name=pl.when(pl.col("Name").is_not_null() & (pl.col("Name") != ""))
+            .then(pl.col("Name"))
+            .otherwise(pl.concat_str([pl.lit("Sales "), pl.col("No.")])),
+            Department=pl.col("Department").fill_null("Belum Dipetakan"),
+        )
     else:
-        agg["Name"] = agg["No."].map(lambda x: f"Sales {x}")
-        agg["Department"] = "Belum Dipetakan"
+        agg = agg.with_columns(
+            Name=pl.concat_str([pl.lit("Sales "), pl.col("No.")]),
+            Department=pl.lit("Belum Dipetakan", dtype=pl.String),
+        )
 
     weights = {
         "Visit": cfg.weight_visit,
@@ -127,36 +184,56 @@ def calculate_sales_performance(
     }
     total_weight = sum(weights.values()) or 1.0
 
-    score = pd.Series(0.0, index=agg.index)
+    scores = [0.0] * len(agg)
     for col, w in weights.items():
-        score = score + _normalize_0_100(agg[col]) * (w / total_weight)
-    agg["Performance_Score"] = score.round(1)
-    agg["Performance_Classification"] = agg["Performance_Score"].map(cfg.classify)
+        norm_list = _normalize_series(agg[col])
+        factor = w / total_weight
+        for i, val in enumerate(norm_list):
+            scores[i] += val * factor
 
-    return agg[SALES_PERFORMANCE_COLUMNS].sort_values(
-        "Performance_Score", ascending=False, kind="stable"
-    ).reset_index(drop=True)
+    scores = [round(s, 1) for s in scores]
+    classifications = [cfg.classify(s) for s in scores]
+
+    agg = agg.with_columns(
+        Performance_Score=pl.Series("Performance_Score", scores, dtype=pl.Float64),
+        Performance_Classification=pl.Series("Performance_Classification", classifications, dtype=pl.String),
+    )
+
+    return agg.select(SALES_PERFORMANCE_COLUMNS).sort("Performance_Score", descending=True)
 
 
 def combine_attendance_and_sales(
-    employee_summary: pd.DataFrame, sales_performance: pd.DataFrame
-) -> pd.DataFrame:
+    employee_summary: Optional[pl.DataFrame], sales_performance: Optional[pl.DataFrame]
+) -> pl.DataFrame:
     """Management view (Section 4 example table): attendance discipline
     next to sales outcomes, joined on Employee ID only — the two data
     sources are never blended at the raw-data level.
     """
-    if employee_summary.empty or sales_performance.empty:
-        return pd.DataFrame()
+    if employee_summary is None or employee_summary.is_empty() or sales_performance is None or sales_performance.is_empty():
+        return pl.DataFrame()
 
-    att = employee_summary[
-        ["No.", "Name", "Department", "Attendance_Rate_%", "Terlambat", "Attendance_Score", "HR_Classification"]
+    df_summary = employee_summary
+    df_sales = sales_performance
+
+    att_cols = [
+        "No.", "Name", "Department", "Attendance_Rate_%", "Terlambat", "Attendance_Score", "HR_Classification"
     ]
-    combined = sales_performance.merge(att, on="No.", suffixes=("", "_att"), how="left")
-    combined["Name"] = combined["Name"].fillna(combined.get("Name_att"))
+    avail_att = [c for c in att_cols if c in df_summary.columns]
+    att = df_summary.select(avail_att)
+
+    att_renamed = att.rename({c: f"{c}_att" for c in avail_att if c != "No."})
+    combined = df_sales.join(att_renamed, on="No.", how="left")
+
     if "Name_att" in combined.columns:
-        combined = combined.drop(columns=["Name_att"])
+        combined = combined.with_columns(
+            Name=pl.coalesce([pl.col("Name"), pl.col("Name_att")])
+        ).drop("Name_att")
+
     if "Department_att" in combined.columns:
-        combined = combined.drop(columns=["Department_att"])
+        combined = combined.with_columns(
+            Department=pl.coalesce([pl.col("Department"), pl.col("Department_att")])
+        ).drop("Department_att")
+
     return combined
 
 

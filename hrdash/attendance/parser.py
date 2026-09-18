@@ -10,8 +10,10 @@ audit trail (Section 15).
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+from datetime import date, datetime
+from typing import Optional
+
+import polars as pl
 
 REQUIRED_COLUMNS = {"No.", "Date/Time"}
 
@@ -25,6 +27,16 @@ DAY_ID = {
     "Sunday": "Minggu",
 }
 
+WEEKDAY_NUM_MAP = {
+    1: "Senin",
+    2: "Selasa",
+    3: "Rabu",
+    4: "Kamis",
+    5: "Jumat",
+    6: "Sabtu",
+    7: "Minggu",
+}
+
 
 class AttendanceValidationError(ValueError):
     """Raised when the uploaded attendance file cannot be processed safely."""
@@ -34,36 +46,33 @@ def _clean_column_name(value: object) -> str:
     return str(value).replace("\n", " ").replace("\r", " ").strip()
 
 
-def parse_datetime_series(series: pd.Series) -> pd.Series:
-    """Robustly parse attendance-machine timestamps.
-
-    The machine export uses ``DD/MM/YYYY HH.MM.SS`` (dots instead of colons
-    for the time portion); both dot and colon separators are accepted.
-    """
-    s = series.astype("string").str.strip()
-    s = s.str.replace(".", ":", regex=False)
-
-    parsed = pd.to_datetime(s, dayfirst=True, errors="coerce")
-
-    missing = parsed.isna()
-    if missing.any():
-        parsed.loc[missing] = pd.to_datetime(
-            s.loc[missing], format="%d/%m/%Y %H:%M:%S", errors="coerce"
-        )
-    return parsed
+def parse_datetime_expr(col_name: str = "Date/Time") -> pl.Expr:
+    """Robustly parse attendance-machine timestamps into pl.Datetime."""
+    s = pl.col(col_name).cast(pl.String).str.strip_chars().str.replace_all(r"\.", ":")
+    return pl.coalesce(
+        [
+            s.str.to_datetime("%d/%m/%Y %H:%M:%S", strict=False),
+            s.str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False),
+            s.str.to_datetime("%d-%m-%Y %H:%M:%S", strict=False),
+            s.str.to_datetime("%Y/%m/%d %H:%M:%S", strict=False),
+            s.str.to_datetime("%d/%m/%Y %H:%M", strict=False),
+            s.str.to_datetime("%Y-%m-%d %H:%M", strict=False),
+            s.str.to_datetime(strict=False),
+        ]
+    )
 
 
-def validate_schema(df: pd.DataFrame) -> list[str]:
+def validate_schema(df: pl.DataFrame) -> list[str]:
     issues: list[str] = []
-    missing = REQUIRED_COLUMNS.difference(df.columns)
+    missing = REQUIRED_COLUMNS.difference(set(df.columns))
     if missing:
         issues.append(f"Kolom wajib tidak ditemukan: {', '.join(sorted(missing))}")
-    if df.empty:
+    if df.is_empty():
         issues.append("File tidak memiliki baris data.")
     return issues
 
 
-def clean_attendance_data(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+def clean_attendance_data(raw_input: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
     """Validate + clean a raw attendance-machine export.
 
     Returns
@@ -72,80 +81,110 @@ def clean_attendance_data(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     rejected_df rows excluded, each tagged with ``_reject_reason``
     quality    data-quality metrics for the UI / README sheet
     """
-    df = raw_df.copy()
-    df.columns = [_clean_column_name(c) for c in df.columns]
+    raw_df = raw_input
+    if raw_df.is_empty() and not raw_df.columns:
+        raise AttendanceValidationError("File tidak memiliki baris data.")
+
+    rename_map = {c: _clean_column_name(c) for c in raw_df.columns}
+    df = raw_df.rename(rename_map)
 
     schema_issues = validate_schema(df)
     if schema_issues:
         raise AttendanceValidationError("; ".join(schema_issues))
 
-    df["_source_row"] = np.arange(2, len(df) + 2)
+    input_row_count = len(df)
+    df = df.with_columns(_source_row=pl.int_range(2, pl.len() + 2, dtype=pl.Int64))
 
     for col in ["No.", "Name", "Department"]:
         if col not in df.columns:
-            df[col] = pd.NA
-        df[col] = df[col].astype("string").str.strip()
+            df = df.with_columns(pl.lit(None, dtype=pl.String).alias(col))
+        else:
+            df = df.with_columns(pl.col(col).cast(pl.String).str.strip_chars().alias(col))
 
-    rejected_parts: list[pd.DataFrame] = []
+    rejected_parts: list[pl.DataFrame] = []
 
-    invalid_identity = df["No."].isna() | (df["No."] == "")
-    if invalid_identity.any():
-        bad = df.loc[invalid_identity].copy()
-        bad["_reject_reason"] = "Employee ID (No.) kosong/tidak valid"
-        rejected_parts.append(bad)
-    df = df.loc[~invalid_identity].copy()
+    # 1. Check valid identity
+    invalid_identity_mask = pl.col("No.").is_null() | (pl.col("No.").str.strip_chars() == "")
+    bad_id = df.filter(invalid_identity_mask)
+    if not bad_id.is_empty():
+        bad_id = bad_id.with_columns(_reject_reason=pl.lit("Employee ID (No.) kosong/tidak valid"))
+        rejected_parts.append(bad_id)
+    df = df.filter(~invalid_identity_mask)
 
-    # Missing identity metadata gets a clear fallback rather than rejection —
-    # the machine log itself is still valid attendance evidence.
-    df["Name"] = df["Name"].fillna("").replace("", pd.NA)
-    df["Department"] = df["Department"].fillna("").replace("", pd.NA)
-    df["Name"] = df["Name"].fillna(df["No."].map(lambda x: f"Karyawan {x}"))
-    df["Department"] = df["Department"].fillna("Belum Dipetakan")
-
-    df["Date/Time"] = parse_datetime_series(df["Date/Time"])
-    invalid_datetime = df["Date/Time"].isna()
-    if invalid_datetime.any():
-        bad = df.loc[invalid_datetime].copy()
-        bad["_reject_reason"] = "Tanggal/jam tidak dapat dibaca"
-        rejected_parts.append(bad)
-    df = df.loc[~invalid_datetime].copy()
-
-    rejected = (
-        pd.concat(rejected_parts, ignore_index=True)
-        if rejected_parts
-        else pd.DataFrame(columns=list(df.columns) + ["_reject_reason"])
+    # Missing metadata fallback
+    df = df.with_columns(
+        Name=pl.when(pl.col("Name").is_null() | (pl.col("Name").str.strip_chars() == ""))
+        .then(pl.concat_str([pl.lit("Karyawan "), pl.col("No.")]))
+        .otherwise(pl.col("Name")),
+        Department=pl.when(pl.col("Department").is_null() | (pl.col("Department").str.strip_chars() == ""))
+        .then(pl.lit("Belum Dipetakan"))
+        .otherwise(pl.col("Department")),
     )
 
-    df = df.sort_values(["No.", "Date/Time", "_source_row"]).reset_index(drop=True)
-    before_dupes = len(df)
-    df = df.drop_duplicates(subset=["No.", "Date/Time"], keep="first").reset_index(drop=True)
-    duplicate_count = before_dupes - len(df)
+    # 2. Parse Date/Time
+    parsed_dt = parse_datetime_expr("Date/Time")
+    df = df.with_columns(_parsed_dt=parsed_dt)
 
-    df["Tanggal"] = df["Date/Time"].dt.date
-    df["Hari"] = df["Date/Time"].dt.day_name().map(DAY_ID)
-    df["Jam"] = df["Date/Time"].dt.time
+    invalid_dt_mask = pl.col("_parsed_dt").is_null()
+    bad_dt = df.filter(invalid_dt_mask)
+    if not bad_dt.is_empty():
+        bad_dt = bad_dt.drop("_parsed_dt").with_columns(
+            _reject_reason=pl.lit("Tanggal/jam tidak dapat dibaca")
+        )
+        rejected_parts.append(bad_dt)
+    df = df.filter(~invalid_dt_mask)
+    df = df.with_columns(pl.col("_parsed_dt").alias("Date/Time")).drop("_parsed_dt")
+
+    all_cols = list(df.columns)
+    if rejected_parts:
+        rejected = pl.concat(
+            [part.select([c for c in all_cols if c in part.columns] + ["_reject_reason"]) for part in rejected_parts],
+            how="diagonal",
+        )
+    else:
+        schema = {c: df.schema.get(c, pl.String) for c in all_cols}
+        schema["_reject_reason"] = pl.String
+        rejected = pl.DataFrame(schema=schema)
+
+    df = df.sort(["No.", "Date/Time", "_source_row"])
+
+    # 3. Deduplicate
+    before_dedup = len(df)
+    df = df.unique(subset=["No.", "Date/Time"], keep="first")
+    duplicate_count = before_dedup - len(df)
+
+    df = df.with_columns(
+        Tanggal=pl.col("Date/Time").dt.date(),
+        Waktu=pl.col("Date/Time").dt.time(),
+        Hari=pl.col("Date/Time").dt.weekday().replace_strict(WEEKDAY_NUM_MAP, default="Senin"),
+    )
+
+    min_date = df["Tanggal"].min() if not df.is_empty() else None
+    max_date = df["Tanggal"].max() if not df.is_empty() else None
+    employee_count = df["No."].n_unique() if not df.is_empty() else 0
 
     quality = {
-        "input_rows": len(raw_df),
+        "input_rows": input_row_count,
         "valid_rows": len(df),
         "rejected_rows": len(rejected),
         "duplicate_rows_removed": duplicate_count,
-        "date_min": df["Tanggal"].min() if not df.empty else None,
-        "date_max": df["Tanggal"].max() if not df.empty else None,
-        "employees": int(df["No."].nunique()) if not df.empty else 0,
+        "date_min": min_date,
+        "date_max": max_date,
+        "employees": employee_count,
     }
     return df, rejected, quality
 
 
-def clean_approved_leave(leave_df: pd.DataFrame | None) -> pd.DataFrame:
+def clean_approved_leave(leave_input: Optional[pl.DataFrame]) -> pl.DataFrame:
     """Optional HR-approved leave/permission input (excludes days from
     absence calculation; never invented, only used when HR supplies it).
     """
-    if leave_df is None or leave_df.empty:
-        return pd.DataFrame(columns=["No.", "Tanggal", "Leave_Type"])
+    if leave_input is None or leave_input.is_empty():
+        return pl.DataFrame(schema={"No.": pl.String, "Tanggal": pl.Date, "Leave_Type": pl.String})
 
-    df = leave_df.copy()
-    df.columns = [_clean_column_name(c) for c in df.columns]
+    df = leave_input
+    rename_map = {c: _clean_column_name(c) for c in df.columns}
+    df = df.rename(rename_map)
 
     id_col = next((c for c in ["No.", "Employee ID", "ID", "NIK"] if c in df.columns), None)
     date_col = next((c for c in ["Tanggal", "Date", "Leave Date"] if c in df.columns), None)
@@ -157,11 +196,15 @@ def clean_approved_leave(leave_df: pd.DataFrame | None) -> pd.DataFrame:
             "dan tanggal (Tanggal/Date/Leave Date)."
         )
 
-    out = pd.DataFrame()
-    out["No."] = df[id_col].astype("string").str.strip()
-    out["Tanggal"] = pd.to_datetime(
-        df[date_col], format="mixed", dayfirst=True, errors="coerce"
-    ).dt.date
-    out["Leave_Type"] = df[type_col].astype("string").str.strip() if type_col else "Approved Leave"
-    out = out.dropna(subset=["No.", "Tanggal"]).drop_duplicates(["No.", "Tanggal"], keep="last")
-    return out.reset_index(drop=True)
+    out = df.select(
+        pl.col(id_col).cast(pl.String).str.strip_chars().alias("No."),
+        parse_datetime_expr(date_col).dt.date().alias("Tanggal"),
+        (
+            pl.col(type_col).cast(pl.String).str.strip_chars()
+            if type_col
+            else pl.lit("Approved Leave", dtype=pl.String)
+        ).alias("Leave_Type"),
+    )
+    out = out.filter(pl.col("No.").is_not_null() & (pl.col("No.") != "") & pl.col("Tanggal").is_not_null())
+    out = out.unique(subset=["No.", "Tanggal"], keep="last")
+    return out

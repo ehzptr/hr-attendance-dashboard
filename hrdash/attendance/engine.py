@@ -17,275 +17,386 @@ the day is normal. Anomaly_Type follows the taxonomy listed in Section 5.
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+import datetime as dt
+from datetime import date, datetime, time, timedelta
 from typing import Iterable, Optional
 
-import numpy as np
-import pandas as pd
+import polars as pl
 
 from ..config import AttendanceConfig
-from .parser import DAY_ID
+from .parser import DAY_ID, WEEKDAY_NUM_MAP
 
 
-def _combine(day: date, t: time) -> pd.Timestamp:
-    return pd.Timestamp(datetime.combine(day, t))
-
-
-def _parse_time_value(val: object) -> Optional[time]:
-    if val is None or pd.isna(val):
+def _parse_time_str(val: object) -> Optional[str]:
+    if val is None:
         return None
     if isinstance(val, time):
-        return val
-    if isinstance(val, (datetime, pd.Timestamp)):
-        return val.time()
+        return val.strftime("%H:%M:%S")
+    if isinstance(val, datetime):
+        return val.time().strftime("%H:%M:%S")
     s = str(val).strip().replace(".", ":")
+    if not s or s.lower() in ("none", "nan", "nat", "<null>", ""):
+        return None
     parts = s.split(":")
     if len(parts) >= 2:
         try:
-            return time(int(parts[0]), int(parts[1]))
+            h, m = int(parts[0]), int(parts[1])
+            sec = int(parts[2]) if len(parts) > 2 else 0
+            return f"{h:02d}:{m:02d}:{sec:02d}"
         except ValueError:
             return None
     return None
 
 
-def build_employee_directory(enriched_log: pd.DataFrame) -> pd.DataFrame:
-    """One row per employee, resolving the most frequent Name/Department/
-    Employee_Type seen in the log (data-quality safety net when no master
-    file was supplied for a given ID).
+def build_employee_directory(df: pl.DataFrame) -> pl.DataFrame:
+    """One row per employee, resolving the Name/Department/Employee_Type/Schedule
+    seen in the log or merged master.
     """
-    rows: list[dict] = []
-    for emp_id, group in enriched_log.groupby("No.", dropna=False):
-        def _mode(col: str, fallback: object) -> object:
-            m = group[col].mode()
-            return m.iloc[0] if not m.empty else fallback
-
-        rows.append(
-            {
-                "No.": emp_id,
-                "Name": _mode("Name", group["Name"].iloc[0]),
-                "Department": _mode("Department", group["Department"].iloc[0]),
-                "Employee_Type": _mode("Employee_Type", group.get("Employee_Type", pd.Series(["OFFICE"])).iloc[0]),
-                "Position": _mode("Position", "") if "Position" in group.columns else "",
-                "Jam_Masuk_Master": _mode("Jam_Masuk_Master", pd.NA) if "Jam_Masuk_Master" in group.columns else pd.NA,
-                "Jam_Pulang_Master": _mode("Jam_Pulang_Master", pd.NA) if "Jam_Pulang_Master" in group.columns else pd.NA,
+    if df.is_empty():
+        return pl.DataFrame(
+            schema={
+                "No.": pl.String,
+                "Name": pl.String,
+                "Department": pl.String,
+                "Employee_Type": pl.String,
+                "Position": pl.String,
+                "Jam_Masuk_Master": pl.String,
+                "Jam_Pulang_Master": pl.String,
             }
         )
-    return pd.DataFrame(rows).sort_values(["Department", "Name"], kind="stable").reset_index(drop=True)
 
+    agg_exprs = [
+        pl.col("Name").drop_nulls().first().alias("Name"),
+        pl.col("Department").drop_nulls().first().alias("Department"),
+    ]
+    if "Employee_Type" in df.columns:
+        agg_exprs.append(pl.col("Employee_Type").drop_nulls().first().fill_null("OFFICE").alias("Employee_Type"))
+    else:
+        agg_exprs.append(pl.lit("OFFICE", dtype=pl.String).alias("Employee_Type"))
 
-def _scan_pair(group: pd.DataFrame, cutoff: time) -> pd.Series:
-    scans = group["Date/Time"].sort_values().tolist()
-    if not scans:
-        return pd.Series({"First_Scan": pd.NaT, "Last_Scan": pd.NaT, "Scan_Count": 0})
+    if "Position" in df.columns:
+        agg_exprs.append(pl.col("Position").drop_nulls().first().fill_null("").alias("Position"))
+    else:
+        agg_exprs.append(pl.lit("", dtype=pl.String).alias("Position"))
 
-    if len(scans) == 1:
-        scan = scans[0]
-        noon = _combine(scan.date(), cutoff)
-        if scan < noon:
-            return pd.Series({"First_Scan": scan, "Last_Scan": pd.NaT, "Scan_Count": 1})
-        return pd.Series({"First_Scan": pd.NaT, "Last_Scan": scan, "Scan_Count": 1})
+    if "Jam_Masuk_Master" in df.columns:
+        agg_exprs.append(pl.col("Jam_Masuk_Master").drop_nulls().first().alias("Jam_Masuk_Master"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.String).alias("Jam_Masuk_Master"))
 
-    return pd.Series({"First_Scan": scans[0], "Last_Scan": scans[-1], "Scan_Count": len(scans)})
+    if "Jam_Pulang_Master" in df.columns:
+        agg_exprs.append(pl.col("Jam_Pulang_Master").drop_nulls().first().alias("Jam_Pulang_Master"))
+    else:
+        agg_exprs.append(pl.lit(None, dtype=pl.String).alias("Jam_Pulang_Master"))
+
+    directory = df.group_by("No.").agg(agg_exprs)
+    return directory.sort(["Department", "Name"])
 
 
 def build_daily_attendance(
-    enriched_log: pd.DataFrame,
+    enriched_log: pl.DataFrame,
     cfg: AttendanceConfig,
     holidays: Optional[Iterable[date]] = None,
-    approved_leave: Optional[pd.DataFrame | object] = None,
+    approved_leave: Optional[pl.DataFrame | object] = None,
     leave_result: Optional[object] = None,
-) -> pd.DataFrame:
-    """Build the Daily Attendance table (Section 5).
+) -> pl.DataFrame:
+    """Build the Daily Attendance table (Section 5) using native vectorized Polars expressions."""
+    if enriched_log.is_empty():
+        return pl.DataFrame()
 
-    ``enriched_log`` is the cleaned raw log after being joined with the
-    Employee Master (``No., Name, Department, Employee_Type, Position``
-    columns present — see ``employee_master.merge_master_into_log``).
-    """
-    if enriched_log.empty:
-        return pd.DataFrame()
-
+    df_log = enriched_log
     holidays_set = set(holidays or [])
-    
+
     # Support both legacy DataFrame and LeaveLoadResult
     lr = leave_result
     if lr is None and hasattr(approved_leave, "leaves") and hasattr(approved_leave, "group_events"):
         lr = approved_leave
-        leave = pd.DataFrame(columns=["No.", "Tanggal", "Leave_Type"])
-    elif isinstance(approved_leave, pd.DataFrame):
+        leave = pl.DataFrame(schema={"No.": pl.String, "Tanggal": pl.Date, "Leave_Type": pl.String})
+    elif isinstance(approved_leave, pl.DataFrame):
         leave = approved_leave
+    elif approved_leave is not None and hasattr(approved_leave, "to_dict"):
+        leave = pl.from_pandas(approved_leave)
     else:
-        leave = pd.DataFrame(columns=["No.", "Tanggal", "Leave_Type"])
+        leave = pl.DataFrame(schema={"No.": pl.String, "Tanggal": pl.Date, "Leave_Type": pl.String})
 
-    start = cfg.start_date or enriched_log["Tanggal"].min()
-    end = cfg.end_date or enriched_log["Tanggal"].max()
+    start = cfg.start_date or df_log["Tanggal"].min()
+    end = cfg.end_date or df_log["Tanggal"].max()
 
-    employees = build_employee_directory(enriched_log)
-    dates = pd.DataFrame({"Tanggal": pd.date_range(start, end).date})
-    employees["_key"] = 1
-    dates["_key"] = 1
-    daily = employees.merge(dates, on="_key").drop(columns="_key")
+    employees = build_employee_directory(df_log)
+    date_list = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    dates_df = pl.DataFrame({"Tanggal": date_list}, schema={"Tanggal": pl.Date})
 
-    daily["Hari"] = pd.to_datetime(daily["Tanggal"]).dt.day_name().map(DAY_ID)
-    daily["Is_Holiday"] = daily["Tanggal"].isin(holidays_set)
+    daily = employees.join(dates_df, how="cross")
 
-    working_days = cfg.working_days
-
-    daily["Is_Approved_Leave"] = False
-    daily["Leave_Type"] = ""
-    if not leave.empty:
-        daily = daily.merge(leave, on=["No.", "Tanggal"], how="left", suffixes=("", "_leave"))
-        leave_col = "Leave_Type_leave" if "Leave_Type_leave" in daily.columns else "Leave_Type"
-        daily["Is_Approved_Leave"] = daily[leave_col].notna()
-        daily["Leave_Type"] = daily[leave_col].fillna("")
-        if leave_col != "Leave_Type":
-            daily = daily.drop(columns=[leave_col])
-
-    daily["Is_Working_Day"] = (
-        daily["Hari"].isin(working_days) & ~daily["Is_Holiday"] & ~daily["Is_Approved_Leave"]
+    daily = daily.with_columns(
+        Hari=pl.col("Tanggal").dt.weekday().replace_strict(WEEKDAY_NUM_MAP, default="Senin"),
+        Is_Holiday=pl.col("Tanggal").is_in(list(holidays_set)),
     )
 
-    scans = (
-        enriched_log.groupby(["No.", "Tanggal"], group_keys=False)
-        .apply(lambda g: _scan_pair(g, cfg.single_scan_cutoff))
-        .reset_index()
-    )
-    daily = daily.merge(scans, on=["No.", "Tanggal"], how="left")
-    daily["Scan_Count"] = daily["Scan_Count"].fillna(0).astype(int)
+    working_days = list(cfg.working_days)
 
-    daily["Jam_Masuk"] = daily["First_Scan"].dt.strftime("%H:%M:%S").fillna("")
-    daily["Jam_Pulang"] = daily["Last_Scan"].dt.strftime("%H:%M:%S").fillna("")
-
-    def evaluate(row: pd.Series) -> pd.Series:
-        tap_in = row["First_Scan"]
-        tap_out = row["Last_Scan"]
-        day = row["Tanggal"]
-        is_working = bool(row["Is_Working_Day"])
-        scan_count = int(row["Scan_Count"])
-
-        if bool(row.get("Is_Approved_Leave", False)):
-            return pd.Series(
-                {
-                    "Status_Masuk": "Cuti Disetujui",
-                    "Status_Pulang": str(row.get("Leave_Type") or "Approved Leave"),
-                    "Menit_Telat": 0,
-                    "Menit_Pulang_Cepat": 0,
-                    "Anomaly_Type": "",
-                    "Severity": "",
-                }
-            )
-
-        if not is_working:
-            if scan_count == 0:
-                return pd.Series(
-                    {
-                        "Status_Masuk": "Libur",
-                        "Status_Pulang": "Libur Normal",
-                        "Menit_Telat": 0,
-                        "Menit_Pulang_Cepat": 0,
-                        "Anomaly_Type": "",
-                        "Severity": "",
-                    }
-                )
-            return pd.Series(
-                {
-                    "Status_Masuk": "Scan Hari Libur",
-                    "Status_Pulang": "Scan Hari Libur",
-                    "Menit_Telat": 0,
-                    "Menit_Pulang_Cepat": 0,
-                    "Anomaly_Type": "Scan Pada Hari Libur",
-                    "Severity": "LOW",
-                }
-            )
-
-        # Custom division/employee schedule from master or global fallback
-        emp_in_time = _parse_time_value(row.get("Jam_Masuk_Master")) or cfg.clock_in
-        schedule_in = _combine(day, emp_in_time)
-        grace_until = schedule_in + pd.Timedelta(minutes=cfg.grace_minutes)
-
-        emp_out_time = _parse_time_value(row.get("Jam_Pulang_Master"))
-        if emp_out_time is None:
-            emp_out_time = cfg.saturday_clock_out if row["Hari"] == "Sabtu" else cfg.weekday_clock_out
-        schedule_out = _combine(day, emp_out_time)
-
-        if scan_count == 0:
-            return pd.Series(
-                {
-                    "Status_Masuk": "Mangkir",
-                    "Status_Pulang": "Mangkir",
-                    "Menit_Telat": 0,
-                    "Menit_Pulang_Cepat": 0,
-                    "Anomaly_Type": "Tidak Ada Transaksi",
-                    "Severity": "HIGH",
-                }
-            )
-
-        anomaly_types: list[str] = []
-
-        if pd.isna(tap_in):
-            status_in = "Lupa Absen Masuk"
-            minutes_late = cfg.default_late_minutes_when_only_clock_out
-            anomaly_types.append("Hanya Scan Siang/Sore")
-        elif tap_in > grace_until:
-            status_in = "Terlambat"
-            minutes_late = max(0, int((tap_in - schedule_in).total_seconds() // 60))
-        else:
-            status_in = "Hadir"
-            minutes_late = 0
-
-        if pd.isna(tap_out):
-            status_out = "Lupa Absen Pulang"
-            minutes_early = 0
-            if "Hanya Scan Siang/Sore" not in anomaly_types:
-                anomaly_types.append("Hanya Scan Pagi")
-        elif tap_out < schedule_out:
-            minutes_early = max(0, int((schedule_out - tap_out).total_seconds() // 60))
-            status_out = "Pulang Cepat"
-        else:
-            minutes_early = 0
-            status_out = "OK"
-
-        if scan_count > 2:
-            anomaly_types.append("Transaksi Lebih Dari Dua Kali")
-
-        severities = []
-        if status_in == "Lupa Absen Masuk" or status_out == "Lupa Absen Pulang":
-            severities.append("HIGH")
-        if status_in == "Terlambat" or status_out == "Pulang Cepat":
-            severities.append("LOW")
-        if scan_count > 2:
-            severities.append("LOW")
-
-        severity = "HIGH" if "HIGH" in severities else ("LOW" if severities else "")
-
-        return pd.Series(
-            {
-                "Status_Masuk": status_in,
-                "Status_Pulang": status_out,
-                "Menit_Telat": minutes_late,
-                "Menit_Pulang_Cepat": minutes_early,
-                "Anomaly_Type": ", ".join(anomaly_types),
-                "Severity": severity,
-            }
+    if not leave.is_empty() and "No." in leave.columns and "Tanggal" in leave.columns:
+        leave_sub = leave.select(["No.", "Tanggal", "Leave_Type"]).unique(subset=["No.", "Tanggal"])
+        daily = daily.join(leave_sub, on=["No.", "Tanggal"], how="left")
+        daily = daily.with_columns(
+            Is_Approved_Leave=pl.col("Leave_Type").is_not_null() & (pl.col("Leave_Type") != ""),
+            Leave_Type=pl.col("Leave_Type").fill_null(""),
+        )
+    else:
+        daily = daily.with_columns(
+            Is_Approved_Leave=pl.lit(False, dtype=pl.Boolean),
+            Leave_Type=pl.lit("", dtype=pl.String),
         )
 
-    evaluation = daily.apply(evaluate, axis=1)
-    daily = pd.concat([daily, evaluation], axis=1)
-
-    duration = (daily["Last_Scan"] - daily["First_Scan"])
-    daily["Work_Duration_Minutes"] = (
-        duration.dt.total_seconds().div(60).where(duration.notna(), np.nan).round(0)
+    daily = daily.with_columns(
+        Is_Working_Day=pl.col("Hari").is_in(working_days) & ~pl.col("Is_Holiday") & ~pl.col("Is_Approved_Leave")
     )
 
-    daily["Is_Anomali"] = (daily["Severity"] != "").astype(int)
-    daily["Work_Day_Flag"] = daily["Is_Working_Day"].astype(int)
-    daily["Present_Flag"] = daily["Status_Masuk"].isin(["Hadir", "Terlambat"]).astype(int)
-    daily["Late_Flag"] = daily["Status_Masuk"].eq("Terlambat").astype(int)
-    daily["Absent_Flag"] = daily["Status_Masuk"].eq("Mangkir").astype(int)
-    daily["Early_Leave_Flag"] = daily["Status_Pulang"].eq("Pulang Cepat").astype(int)
-    daily["Forgot_Punch_Flag"] = (
-        daily["Status_Masuk"].eq("Lupa Absen Masuk") | daily["Status_Pulang"].eq("Lupa Absen Pulang")
-    ).astype(int)
-    daily["Tidak_Absen_Pulang_Flag"] = daily["Status_Pulang"].eq("Lupa Absen Pulang").astype(int)
+    # Vectorized scan aggregation per employee per day
+    cutoff_time = cfg.single_scan_cutoff
+    cutoff_str = cutoff_time.strftime("%H:%M:%S")
+
+    scans_grouped = (
+        df_log.sort(["No.", "Tanggal", "Date/Time"])
+        .group_by(["No.", "Tanggal"], maintain_order=True)
+        .agg(
+            pl.col("Date/Time").first().alias("_first_raw"),
+            pl.col("Date/Time").last().alias("_last_raw"),
+            pl.len().alias("Scan_Count"),
+        )
+    )
+
+    # Vectorize single-scan vs multi-scan extraction
+    is_single_morning = (pl.col("Scan_Count") == 1) & (
+        pl.col("_first_raw").dt.strftime("%H:%M:%S") < cutoff_str
+    )
+    is_single_afternoon = (pl.col("Scan_Count") == 1) & (
+        pl.col("_first_raw").dt.strftime("%H:%M:%S") >= cutoff_str
+    )
+    is_multi = pl.col("Scan_Count") > 1
+
+    scans_df = scans_grouped.with_columns(
+        First_Scan=pl.when(is_single_morning | is_multi)
+        .then(pl.col("_first_raw"))
+        .otherwise(None)
+        .cast(pl.Datetime),
+        Last_Scan=pl.when(is_single_afternoon)
+        .then(pl.col("_first_raw"))
+        .when(is_multi)
+        .then(pl.col("_last_raw"))
+        .otherwise(None)
+        .cast(pl.Datetime),
+    ).select(["No.", "Tanggal", "First_Scan", "Last_Scan", "Scan_Count"])
+
+    daily = daily.join(scans_df, on=["No.", "Tanggal"], how="left")
+    daily = daily.with_columns(Scan_Count=pl.col("Scan_Count").fill_null(0).cast(pl.Int64))
+
+    # Vectorized schedule calculation
+    in_time_str = cfg.clock_in.strftime("%H:%M:%S")
+    out_weekday_str = cfg.weekday_clock_out.strftime("%H:%M:%S")
+    out_sat_str = cfg.saturday_clock_out.strftime("%H:%M:%S")
+
+    # Format Master In/Out to HH:MM:SS format
+    daily = daily.with_columns(
+        _in_time_norm=pl.coalesce(
+            [
+                pl.col("Jam_Masuk_Master").str.to_time("%H:%M", strict=False).dt.strftime("%H:%M:%S"),
+                pl.col("Jam_Masuk_Master").str.to_time("%H:%M:%S", strict=False).dt.strftime("%H:%M:%S"),
+                pl.lit(in_time_str),
+            ]
+        ),
+        _out_default=pl.when(pl.col("Hari") == "Sabtu").then(pl.lit(out_sat_str)).otherwise(pl.lit(out_weekday_str)),
+    )
+    daily = daily.with_columns(
+        _out_time_norm=pl.coalesce(
+            [
+                pl.col("Jam_Pulang_Master").str.to_time("%H:%M", strict=False).dt.strftime("%H:%M:%S"),
+                pl.col("Jam_Pulang_Master").str.to_time("%H:%M:%S", strict=False).dt.strftime("%H:%M:%S"),
+                pl.col("_out_default"),
+            ]
+        )
+    )
+
+    # Combine Tanggal + Time into Datetime
+    schedule_in_expr = (
+        pl.concat_str([pl.col("Tanggal").cast(pl.String), pl.lit(" "), pl.col("_in_time_norm")])
+        .str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
+    )
+    grace_until_expr = schedule_in_expr + pl.duration(minutes=cfg.grace_minutes)
+
+    schedule_out_expr = (
+        pl.concat_str([pl.col("Tanggal").cast(pl.String), pl.lit(" "), pl.col("_out_time_norm")])
+        .str.to_datetime("%Y-%m-%d %H:%M:%S", strict=False)
+    )
+
+    daily = daily.with_columns(
+        _schedule_in=schedule_in_expr,
+        _grace_until=grace_until_expr,
+        _schedule_out=schedule_out_expr,
+    )
+
+    # Vectorized Status Masuk
+    status_masuk_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.lit("Cuti Disetujui"))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") == 0))
+        .then(pl.lit("Libur"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit("Scan Hari Libur"))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("Mangkir"))
+        .when(pl.col("First_Scan").is_null())
+        .then(pl.lit("Lupa Absen Masuk"))
+        .when(pl.col("First_Scan") > pl.col("_grace_until"))
+        .then(pl.lit("Terlambat"))
+        .otherwise(pl.lit("Hadir"))
+    )
+
+    # Vectorized Status Pulang
+    status_pulang_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.when(pl.col("Leave_Type") != "").then(pl.col("Leave_Type")).otherwise(pl.lit("Approved Leave")))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") == 0))
+        .then(pl.lit("Libur Normal"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit("Scan Hari Libur"))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("Mangkir"))
+        .when(pl.col("Last_Scan").is_null())
+        .then(pl.lit("Lupa Absen Pulang"))
+        .when(pl.col("Last_Scan") < pl.col("_schedule_out"))
+        .then(pl.lit("Pulang Cepat"))
+        .otherwise(pl.lit("OK"))
+    )
+
+    daily = daily.with_columns(
+        Status_Masuk=status_masuk_expr,
+        Status_Pulang=status_pulang_expr,
+    )
+
+    # Vectorized Menit Telat & Pulang Cepat
+    late_diff_minutes = (
+        (pl.col("First_Scan") - pl.col("_schedule_in")).dt.total_seconds() / 60.0
+    ).floor().cast(pl.Int64).clip(lower_bound=0)
+
+    early_diff_minutes = (
+        (pl.col("_schedule_out") - pl.col("Last_Scan")).dt.total_seconds() / 60.0
+    ).floor().cast(pl.Int64).clip(lower_bound=0)
+
+    daily = daily.with_columns(
+        Menit_Telat=pl.when(pl.col("Is_Approved_Leave") | ~pl.col("Is_Working_Day") | (pl.col("Scan_Count") == 0))
+        .then(pl.lit(0, dtype=pl.Int64))
+        .when(pl.col("Status_Masuk") == "Lupa Absen Masuk")
+        .then(pl.lit(cfg.default_late_minutes_when_only_clock_out, dtype=pl.Int64))
+        .when(pl.col("Status_Masuk") == "Terlambat")
+        .then(late_diff_minutes)
+        .otherwise(pl.lit(0, dtype=pl.Int64)),
+        Menit_Pulang_Cepat=pl.when(
+            pl.col("Is_Approved_Leave") | ~pl.col("Is_Working_Day") | (pl.col("Scan_Count") == 0)
+        )
+        .then(pl.lit(0, dtype=pl.Int64))
+        .when(pl.col("Status_Pulang") == "Pulang Cepat")
+        .then(early_diff_minutes)
+        .otherwise(pl.lit(0, dtype=pl.Int64)),
+    )
+
+    # Vectorized Anomaly_Type & Severity
+    anom_list_expr = pl.concat_list(
+        [
+            pl.when(
+                pl.col("First_Scan").is_null()
+                & (pl.col("Scan_Count") > 0)
+                & pl.col("Is_Working_Day")
+                & ~pl.col("Is_Approved_Leave")
+            )
+            .then(pl.lit("Hanya Scan Siang/Sore"))
+            .otherwise(None),
+            pl.when(
+                pl.col("Last_Scan").is_null()
+                & (pl.col("Scan_Count") > 0)
+                & pl.col("Is_Working_Day")
+                & pl.col("First_Scan").is_not_null()
+                & ~pl.col("Is_Approved_Leave")
+            )
+            .then(pl.lit("Hanya Scan Pagi"))
+            .otherwise(None),
+            pl.when(
+                (pl.col("Scan_Count") > 2)
+                & pl.col("Is_Working_Day")
+                & ~pl.col("Is_Approved_Leave")
+            )
+            .then(pl.lit("Transaksi Lebih Dari Dua Kali"))
+            .otherwise(None),
+        ]
+    ).list.drop_nulls().list.join(", ")
+
+    anomaly_type_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.lit(""))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") > 0))
+        .then(pl.lit("Scan Pada Hari Libur"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit(""))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("Tidak Ada Transaksi"))
+        .otherwise(anom_list_expr)
+    )
+
+    severity_expr = (
+        pl.when(pl.col("Is_Approved_Leave"))
+        .then(pl.lit(""))
+        .when(~pl.col("Is_Working_Day") & (pl.col("Scan_Count") > 0))
+        .then(pl.lit("LOW"))
+        .when(~pl.col("Is_Working_Day"))
+        .then(pl.lit(""))
+        .when(pl.col("Scan_Count") == 0)
+        .then(pl.lit("HIGH"))
+        .when(
+            (pl.col("Status_Masuk") == "Lupa Absen Masuk")
+            | (pl.col("Status_Pulang") == "Lupa Absen Pulang")
+        )
+        .then(pl.lit("HIGH"))
+        .when(
+            (pl.col("Status_Masuk") == "Terlambat")
+            | (pl.col("Status_Pulang") == "Pulang Cepat")
+            | (pl.col("Scan_Count") > 2)
+        )
+        .then(pl.lit("LOW"))
+        .otherwise(pl.lit(""))
+    )
+
+    daily = daily.with_columns(
+        Anomaly_Type=anomaly_type_expr,
+        Severity=severity_expr,
+    )
+
+    # Duration and flags
+    duration_secs = (pl.col("Last_Scan") - pl.col("First_Scan")).dt.total_seconds()
+    daily = daily.with_columns(
+        Jam_Masuk=pl.col("First_Scan").dt.strftime("%H:%M:%S").fill_null(""),
+        Jam_Pulang=pl.col("Last_Scan").dt.strftime("%H:%M:%S").fill_null(""),
+        Work_Duration_Minutes=pl.when(pl.col("First_Scan").is_not_null() & pl.col("Last_Scan").is_not_null())
+        .then((duration_secs / 60.0).round(0))
+        .otherwise(None),
+        Is_Anomali=pl.when(pl.col("Severity") != "").then(1).otherwise(0).cast(pl.Int64),
+        Work_Day_Flag=pl.when(pl.col("Is_Working_Day")).then(1).otherwise(0).cast(pl.Int64),
+        Present_Flag=pl.when(pl.col("Status_Masuk").is_in(["Hadir", "Terlambat"])).then(1).otherwise(0).cast(pl.Int64),
+        Late_Flag=pl.when(pl.col("Status_Masuk") == "Terlambat").then(1).otherwise(0).cast(pl.Int64),
+        Absent_Flag=pl.when(pl.col("Status_Masuk") == "Mangkir").then(1).otherwise(0).cast(pl.Int64),
+        Early_Leave_Flag=pl.when(pl.col("Status_Pulang") == "Pulang Cepat").then(1).otherwise(0).cast(pl.Int64),
+        Forgot_Punch_Flag=pl.when(
+            (pl.col("Status_Masuk") == "Lupa Absen Masuk") | (pl.col("Status_Pulang") == "Lupa Absen Pulang")
+        )
+        .then(1)
+        .otherwise(0)
+        .cast(pl.Int64),
+        Tidak_Absen_Pulang_Flag=pl.when(pl.col("Status_Pulang") == "Lupa Absen Pulang").then(1).otherwise(0).cast(pl.Int64),
+    )
+
+    # Drop temporary calculation columns
+    daily = daily.drop(
+        ["_in_time_norm", "_out_default", "_out_time_norm", "_schedule_in", "_grace_until", "_schedule_out"]
+    )
 
     # If leave result (multi-sheet Cuti, Lembur, Kegiatan Bersama) provided, apply integration
     if lr is not None:
@@ -303,7 +414,7 @@ def build_daily_attendance(
         "Overtime_Hours", "Overtime_Status", "Group_Event",
         "First_Scan", "Last_Scan",
     ]
-    ordered_cols = [c for c in ordered_cols if c in daily.columns]
-    daily = daily[ordered_cols]
+    avail_cols = [c for c in ordered_cols if c in daily.columns]
+    daily = daily.select(avail_cols)
 
-    return daily.sort_values(["Tanggal", "Department", "Name"], kind="stable").reset_index(drop=True)
+    return daily.sort(["Tanggal", "Department", "Name"])
